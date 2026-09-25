@@ -784,6 +784,14 @@ def test_worker_lifecycle_through_tools(worker_env):
 # ---------------------------------------------------------------------------
 
 
+def test_kanban_guidance_prevents_blocked_parent_followup_deadlock():
+    """A gate that must block cannot parent the repair/review needed to unblock it."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "Never create that follow-up as your child" in KANBAN_GUIDANCE
+    assert "blocked parent -> todo child" in KANBAN_GUIDANCE
+    assert "block with evidence and request operator routing" in KANBAN_GUIDANCE
+    assert "repair/review -> continuation gate" in KANBAN_GUIDANCE
 # ---------------------------------------------------------------------------
 # Worker task-ownership enforcement (regression tests for #19534)
 # ---------------------------------------------------------------------------
