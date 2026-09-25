@@ -230,3 +230,24 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+def test_api_paginate_falls_back_when_gh_lacks_slurp(monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+    from hermes_cli import kanban_pr_acceptance as acceptance
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if "--slurp" in command:
+            raise subprocess.CalledProcessError(1, command, stderr="unknown flag: --slurp")
+        return SimpleNamespace(stdout='[{"page": 1}]\n[{"page": 2}]\n')
+
+    monkeypatch.setattr(acceptance.subprocess, "run", fake_run)
+
+    assert acceptance._api("repos/acme/repo/rules", paginate=True) == [
+        [{"page": 1}],
+        [{"page": 2}],
+    ]
+    assert "--slurp" in calls[0]
+    assert "--slurp" not in calls[1]
