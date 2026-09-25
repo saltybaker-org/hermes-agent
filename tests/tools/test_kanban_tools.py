@@ -1258,3 +1258,13 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_kanban_guidance_rejected_gate_blocks_instead_of_completes():
+    """A rejecting review/QA gate must not become done and promote merge."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "REQUEST_CHANGES or FAIL" in KANBAN_GUIDANCE
+    assert "must call `kanban_block`" in KANBAN_GUIDANCE
+    assert "Never call `kanban_complete` for a rejecting gate verdict" in KANBAN_GUIDANCE
+    assert "failed gate must not promote its downstream merge or release card" in KANBAN_GUIDANCE
