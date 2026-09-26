@@ -33,6 +33,8 @@ def github(tmp_path, monkeypatch):
                 if state.get("stale"):
                     run["head_sha"] = "b" * 40
                 runs = [] if state.get("missing") else [run]
+                if state.get("duplicate_required") and runs:
+                    runs.insert(0, {**run, "id": 41, "conclusion": "failure"})
                 value = [{"total_count": 100 + len(runs), "check_runs": [
                     {**run, "id": 1000 + i, "name": "optional", "conclusion": "skipped"}
                     for i in range(100)]}, {"total_count": 100 + len(runs), "check_runs": runs}]
@@ -251,3 +253,23 @@ def test_api_paginate_falls_back_when_gh_lacks_slurp(monkeypatch):
     ]
     assert "--slurp" in calls[0]
     assert "--slurp" not in calls[1]
+
+@pytest.mark.linux_only
+def test_pr_completion_uses_latest_required_check_rerun(github):
+    github.update(conclusion="success", head="a" * 40, duplicate_required=True)
+    with connect() as conn:
+        tid = kb.create_task(conn, title="rerun", completion_contract="acme/repo")
+        assert kb.complete_task(
+            conn, tid, metadata={"published_pr": "https://github.com/acme/repo/pull/7"}
+        )
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()[0])
+    assert receipt["ok"] is True
+    assert receipt["checks"] == [{
+        "name": "required", "id": 42,
+        "url": "https://github.com/acme/repo/actions/runs/42",
+        "head_sha": "a" * 40, "classification": "success",
+        "conclusion": "success",
+    }]

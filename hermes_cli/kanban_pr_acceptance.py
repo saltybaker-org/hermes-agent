@@ -179,9 +179,14 @@ def collect_acceptance(contract: str, published_pr: str | None,
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
                         (app_id in (None, -1) or r["app"]["id"] == app_id)]
+            # GitHub retains older attempts when a workflow is rerun at the same
+            # SHA. Only the newest required context/app result is authoritative;
+            # otherwise a repaired green rerun remains permanently poisoned by
+            # historical failures. A newest pending/failure still blocks.
+            latest_run = max(matching, key=lambda r: r["id"]) if matching else None
             # A legacy status can satisfy an unpinned context, but never a check pinned to an app.
             legacy = [s for s in statuses if s["context"] == context] if app_id in (None, -1) else []
-            selected = matching + ([max(legacy, key=lambda s: s["id"])] if legacy else [])
+            selected = ([latest_run] if latest_run else []) + ([max(legacy, key=lambda s: s["id"])] if legacy else [])
             if not selected:
                 outcomes.append("missing")
                 receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha})
