@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import hashlib
 import os
 import re
 import secrets
@@ -2902,7 +2903,8 @@ def complete_task(
         return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
-    _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    if not closure_authorized:
+        _gate_empty_completion(conn, task_id, result=result, summary=summary)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )

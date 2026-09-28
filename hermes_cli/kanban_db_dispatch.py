@@ -2051,6 +2051,8 @@ def _dispatch_lane_task(
             _kb._append_event(conn, task_id, "jev_dispatch_denied", {
                 "reason": str(exc), "mutate_board": False,
             })
+        result.auto_blocked.append(task_id)
+        return False
     # Re-check the durable row immediately before claim.  This is the
     # non-bypassable backstop for imports, legacy DBs, direct SQL and any
     # post-create content mutation that skipped create_task admission.

@@ -22,7 +22,7 @@ def _fixture(conn):
     rejected=kb.create_task(conn,title="rejected",body="x")
     replacement=kb.create_task(conn,title="replacement",body="x")
     merge_task=kb.create_task(conn,title="merge",body="x")
-    assert kb.complete_task(conn,replacement);assert kb.complete_task(conn,merge_task);_status(conn,rejected,"blocked")
+    assert kb.complete_task(conn,replacement,result="replacement gate approved");assert kb.complete_task(conn,merge_task,result="merge verified");_status(conn,rejected,"blocked")
     kb.link_tasks(conn,rejected,merge_task); kb.link_tasks(conn,replacement,merge_task)
     r=kva.record_gate_verdict(conn,rejected,gate_kind="security",verdict="REJECT",candidate_sha=sha,reviewer="hermes:reviewer",author="hermes:author")
     n=kva.record_gate_verdict(conn,replacement,gate_kind="security",verdict="APPROVE",candidate_sha=sha,reviewer="hermes:other",author="hermes:author")
