@@ -238,7 +238,8 @@ def _finalize_wav_output(wav_path: str, output_path: str) -> str:
     if not ffmpeg:
         os.rename(wav_path, output_path)
         return output_path
-    _ffmpeg_run(ffmpeg, ["-i", wav_path, "-y", "-loglevel", "error", output_path],
+    opus_args = _OPUS_VOICE_ARGS if output_path.lower().endswith(".ogg") else []
+    _ffmpeg_run(ffmpeg, ["-i", wav_path, *opus_args, "-y", "-loglevel", "error", output_path],
                 check=True, capture=False)
     _remove_quietly(wav_path)
     return output_path
