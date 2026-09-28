@@ -254,13 +254,14 @@ def test_api_paginate_falls_back_when_gh_lacks_slurp(monkeypatch):
     assert "--slurp" in calls[0]
     assert "--slurp" not in calls[1]
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("posix")
 def test_pr_completion_uses_latest_required_check_rerun(github):
     github.update(conclusion="success", head="a" * 40, duplicate_required=True)
     with connect() as conn:
         tid = kb.create_task(conn, title="rerun", completion_contract="acme/repo")
         assert kb.complete_task(
-            conn, tid, metadata={"published_pr": "https://github.com/acme/repo/pull/7"}
+            conn, tid, result="required check rerun passed",
+            metadata={"published_pr": "https://github.com/acme/repo/pull/7"},
         )
         receipt = json.loads(conn.execute(
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance' ORDER BY id DESC LIMIT 1",
