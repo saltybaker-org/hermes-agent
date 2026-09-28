@@ -1110,6 +1110,22 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
 
 
+def _cmd_verified_archive(args: argparse.Namespace) -> int:
+    from pathlib import Path
+    from hermes_cli import kanban_verified_archive as kva
+    try:
+        manifest = kva.load_manifest(Path(args.manifest))
+        with kbc.connect_closing() as conn:
+            receipt = kva.verified_archive_superseded_gate(conn, manifest)
+    except kva.VerifiedArchiveDenied as exc:
+        return _err(f"verified archive denied: {exc}", 2)
+    if getattr(args, "json", False):
+        _print_json(receipt)
+    else:
+        print(f"Verified archive {receipt['archived_task_id']} superseded by {receipt['replacement_task_id']}")
+    return 0
+
+
 def _cmd_stats(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         stats = kb.board_stats(conn)
@@ -1306,7 +1322,8 @@ _HANDLERS = {
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
-    "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
+    "archive": _cmd_archive, "verified-archive": _cmd_verified_archive,
+    "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
