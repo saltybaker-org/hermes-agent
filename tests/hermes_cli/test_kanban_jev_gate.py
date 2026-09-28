@@ -273,3 +273,29 @@ def test_pipeline_blocked_status_precedes_triage(board):
     cards=[{"key":"one","stage":"requirements","title":"one","triage":True,"initial_status":"blocked","parents":[]}];manifest={"schema_version":"fellowship-pipeline.v1","feature_id":"F-both","cards":cards}
     task=pipeline.create_pipeline(conn,manifest,cards)["one"]
     assert kb.get_task(conn,task).status=="blocked"
+
+
+def test_publish_closure_cli_completes_the_exact_live_worker_run(board,monkeypatch):
+    import argparse,contextlib,os,time
+    from hermes_cli import kanban as kc
+    conn,root=board
+    task_id=kb.create_task(conn,title="closure worker",body="body",assignee="worker")
+    with kb.write_txn(conn):
+        kb._append_event(conn,task_id,"pipeline_stage",{"stage":"closure_merge","feature_id":"F-cli"})
+    claimed=kb.claim_task(conn,task_id,claimer="worker")
+    assert claimed is not None
+    kbd._set_worker_pid(conn,task_id,os.getpid())
+    script=_script(root,"allow-cli-closure.py",'import json;print(json.dumps({"schema_version":"fellowship-closure-preflight.v1","ok":True,"mutate_board":False}))')
+    _enable(root,script)
+    evidence=root/"evidence.json";evidence.write_text(json.dumps({"feature_id":"F-cli"}))
+    document=root/"closure.md";document.write_bytes(b"exact cli closure")
+    monkeypatch.setenv("HERMES_KANBAN_TASK",task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID",str(claimed.current_run_id))
+    monkeypatch.setattr(kc.kbc,"connect_closing",lambda:contextlib.nullcontext(conn))
+    args=argparse.Namespace(task_id=task_id,evidence=str(evidence),document=str(document),result="published",summary=None,json=False)
+
+    assert kc._cmd_publish_closure(args)==0
+    assert kb.get_task(conn,task_id).status=="done"
+    row=conn.execute("SELECT evidence_json,document_bytes FROM task_closure_publications WHERE task_id=?",(task_id,)).fetchone()
+    assert json.loads(row["evidence_json"])=={"feature_id":"F-cli"}
+    assert bytes(row["document_bytes"])==b"exact cli closure"

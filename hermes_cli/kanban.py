@@ -420,7 +420,11 @@ def _cmd_publish_closure(args: argparse.Namespace) -> int:
     try:
         evidence=pipeline.load_json_object(Path(args.evidence))
         with kbc.connect_closing() as conn:
-            ok=publish_closure(conn,args.task_id,evidence=evidence,document=Path(args.document),result=args.result,summary=args.summary)
+            ok=publish_closure(
+                conn,args.task_id,evidence=evidence,document=Path(args.document),
+                result=args.result,summary=args.summary,
+                expected_run_id=_worker_run_id_for(args.task_id),
+            )
     except (pipeline.PipelineConstructionError,JevAuthorizationError) as exc:
         return _err(f"closure publication denied: {exc}",2)
     if not ok: return _err("closure publication denied by task lifecycle",2)
