@@ -837,6 +837,14 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    ("worker_max_turns", "worker_max_turns INTEGER NOT NULL DEFAULT 500"),
+    ("budget_exception_reason", "budget_exception_reason TEXT"),
+    ("budget_exception_receipt", "budget_exception_receipt TEXT"),
+    ("budget_exception_actor", "budget_exception_actor TEXT"),
+    ("budget_exception_at", "budget_exception_at INTEGER"),
+    ("budget_exception_measured_bytes", "budget_exception_measured_bytes INTEGER"),
+    ("budget_exception_limit_bytes", "budget_exception_limit_bytes INTEGER"),
+    ("budget_policy_version", "budget_policy_version TEXT"),
 )
 
 _NOTIFY_SUB_COLUMNS = (

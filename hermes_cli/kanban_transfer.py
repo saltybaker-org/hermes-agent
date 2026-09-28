@@ -67,7 +67,7 @@ def _snapshot_db(source: Path, target: Path) -> None:
         src.backup(dst)
 
 
-def _scrub_local_state(conn: sqlite3.Connection) -> None:
+def _scrub_local_state(conn: sqlite3.Connection, *, clear_budget_exceptions: bool = False) -> None:
     """Strip machine-local runtime state (claims, PIDs, and above all the
     gateway chat ids subscribed to task events). Caller owns the transaction.
     Run on export and again on import (an archive is untrusted input)."""
@@ -101,6 +101,18 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
         (int(time.time()),),
     )
     conn.execute("UPDATE task_runs SET claim_lock = NULL, worker_pid = NULL")
+    if clear_budget_exceptions:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        exception_columns = {
+            "budget_exception_reason", "budget_exception_receipt", "budget_exception_actor", "budget_exception_at",
+            "budget_exception_measured_bytes", "budget_exception_limit_bytes", "budget_policy_version",
+        }
+        if exception_columns.issubset(columns):
+            conn.execute(
+                "UPDATE tasks SET budget_exception_reason=NULL, budget_exception_receipt=NULL, budget_exception_actor=NULL, "
+                "budget_exception_at=NULL, budget_exception_measured_bytes=NULL, "
+                "budget_exception_limit_bytes=NULL, budget_policy_version=NULL"
+            )
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -247,7 +259,8 @@ def _relocate_imported_rows(conn: sqlite3.Connection, slug: str) -> tuple[dict[s
     attachments_dir = kb.attachments_root(slug)
 
     with kb.write_txn(conn):
-        _scrub_local_state(conn)
+        # Exception receipts are local authority and never trusted from an archive.
+        _scrub_local_state(conn, clear_budget_exceptions=True)
 
         dropped = rehomed = 0
         for row in conn.execute("SELECT id, task_id, stored_path FROM task_attachments").fetchall():

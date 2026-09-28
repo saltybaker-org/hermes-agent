@@ -631,25 +631,10 @@ def _open_parent_refusal(conn, task_id: str, s: str) -> Optional[str]:
 
 
 def _patch_title_body(conn, task_id: str, payload: UpdateTaskBody, board: Optional[str]) -> None:
-    """PATCH title/body phase: one UPDATE + ``edited`` event, then the post-commit observer
-    (field names only — values never leave the DB via this payload)."""
-    with kanban_db.write_txn(conn):
-        sets, vals = [], []
-        if payload.title is not None:
-            if not payload.title.strip():
-                raise HTTPException(status_code=400, detail="title cannot be empty")
-            sets.append("title = ?")
-            vals.append(payload.title.strip())
-        if payload.body is not None:
-            sets.append("body = ?")
-            vals.append(payload.body)
-        vals.append(task_id)
-        conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals)
-        conn.execute(
-            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'edited', NULL, ?)",
-            (task_id, int(time.time())))
-    kanban_db.notify_task_updated(
-        conn, task_id, [f for f in ("title", "body") if getattr(payload, f) is not None], board=board)
+    """PATCH title/body through the central budget-aware semantic mutator."""
+    if not kanban_db.edit_task_content(conn,task_id,title=payload.title,body=payload.body):
+        raise HTTPException(status_code=404,detail="task not found")
+    kanban_db.notify_task_updated(conn,task_id,[f for f in ("title","body") if getattr(payload,f) is not None],board=board)
 
 
 @router.patch("/tasks/{task_id}")
@@ -672,7 +657,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.priority is not None:
             _set_priority(conn, task_id, payload.priority, board)
         if payload.title is not None or payload.body is not None:
-            _patch_title_body(conn, task_id, payload, board)
+            with _map_errors(400, ValueError):
+                _patch_title_body(conn, task_id, payload, board)
         updated = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(updated) if updated else None}
 

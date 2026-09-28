@@ -732,6 +732,14 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    worker_max_turns: int = 500
+    budget_exception_reason: Optional[str] = None
+    budget_exception_receipt: Optional[str] = None
+    budget_exception_actor: Optional[str] = None
+    budget_exception_at: Optional[int] = None
+    budget_exception_measured_bytes: Optional[int] = None
+    budget_exception_limit_bytes: Optional[int] = None
+    budget_policy_version: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -762,6 +770,9 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    "worker_max_turns", "budget_exception_reason", "budget_exception_receipt", "budget_exception_actor",
+    "budget_exception_at", "budget_exception_measured_bytes",
+    "budget_exception_limit_bytes", "budget_policy_version",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -966,7 +977,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    worker_max_turns INTEGER NOT NULL DEFAULT 500,
+    budget_exception_reason TEXT,
+    budget_exception_actor TEXT,
+    budget_exception_at INTEGER,
+    budget_exception_measured_bytes INTEGER,
+    budget_exception_limit_bytes INTEGER,
+    budget_policy_version TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1260,6 +1278,9 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    worker_max_turns: int = 500,
+    budget_exception_reason: Optional[str] = None,
+    budget_exception_receipt: Optional[dict] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1285,6 +1306,26 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    # A successful idempotent admission is durable; retries return it before
+    # revalidating an external receipt that may have expired meanwhile.
+    if idempotency_key:
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
+        ).fetchone()
+        if row:
+            return row["id"]
+    from hermes_cli.kanban_limits import evaluate_card_budget
+    if budget_exception_reason:
+        raise PermissionError("self-asserted exceptions are forbidden; provide a signed receipt")
+    now = int(time.time())
+    budget = evaluate_card_budget(
+        title.strip(), body, worker_max_turns=worker_max_turns,
+        exception_receipt=budget_exception_receipt, idempotency_key=idempotency_key,
+        admission_time=now,
+    )
+    budget_exception_actor = str((budget_exception_receipt or {}).get("actor", "")).strip() or None
+    budget_exception_reason = str((budget_exception_receipt or {}).get("reason", "")).strip() or None
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
     # A project-scoped board anchors every new task to its project's repo
@@ -1313,19 +1354,6 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
-
-    # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
-    # race may insert twice, the next lookup stabilises on the newest.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
-    now = int(time.time())
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
     # task inheriting it would point cleanup at the user's source tree.
@@ -1372,6 +1400,24 @@ def create_task(
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
                     ),
                 )
+                exception_at = now if budget.exception_authorized else None
+                conn.execute(
+                    "UPDATE tasks SET worker_max_turns = ?, budget_exception_reason = ?, budget_exception_receipt = ?, "
+                    "budget_exception_actor = ?, budget_exception_at = ?, "
+                    "budget_exception_measured_bytes = ?, budget_exception_limit_bytes = ?, "
+                    "budget_policy_version = ? WHERE id = ?",
+                    (
+                        budget.worker_max_turns,
+                        budget_exception_reason if budget.exception_authorized else None,
+                        json.dumps(budget_exception_receipt,sort_keys=True,separators=(",",":")) if budget.exception_authorized else None,
+                        budget_exception_actor if budget.exception_authorized else None,
+                        exception_at,
+                        budget.measured_bytes if budget.exception_authorized else None,
+                        budget.limit_bytes if budget.exception_authorized else None,
+                        budget.policy_version if budget.exception_authorized else None,
+                        task_id,
+                    ),
+                )
                 for pid in parents:
                     _link(conn, pid, task_id)
                 _append_event(
@@ -1388,12 +1434,25 @@ def create_task(
                         "workspace_path": workspace_path,
                         "branch_name": branch_name,
                         "project_id": project_id,
+                        "worker_max_turns": budget.worker_max_turns,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
                     },
                 )
+                if budget.exception_authorized:
+                    _append_event(
+                        conn, task_id, "budget_exception",
+                        {
+                            "actor": budget_exception_actor.strip(),
+                            "reason": budget_exception_reason.strip(),
+                            "measured_bytes": budget.measured_bytes,
+                            "limit_bytes": budget.limit_bytes,
+                            "worker_max_turns": budget.worker_max_turns,
+                            "policy_version": budget.policy_version,
+                        },
+                    )
                 if task_status == "blocked":
                     _append_event(
                         conn,
@@ -3681,6 +3740,23 @@ def invalidate_descendants_for_parent_reopen(
     return {"invalidated": invalidated, "terminations": terminations}
 
 
+def edit_task_content(conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None, body: Optional[str] = None) -> bool:
+    """Atomically validate and edit card content, clearing content-bound exceptions."""
+    if title is not None and not title.strip():
+        raise ValueError("title cannot be empty")
+    with write_txn(conn):
+        row=conn.execute("SELECT title,body,worker_max_turns FROM tasks WHERE id=?",(task_id,)).fetchone()
+        if row is None: return False
+        proposed_title=title.strip() if title is not None else (row["title"] or "")
+        proposed_body=body if body is not None else (row["body"] or "")
+        if proposed_title==(row["title"] or "") and proposed_body==(row["body"] or ""): return True
+        from hermes_cli.kanban_limits import evaluate_card_budget
+        evaluate_card_budget(proposed_title,proposed_body,worker_max_turns=row["worker_max_turns"])
+        conn.execute("UPDATE tasks SET title=?,body=?,budget_exception_reason=NULL,budget_exception_receipt=NULL,budget_exception_actor=NULL,budget_exception_at=NULL,budget_exception_measured_bytes=NULL,budget_exception_limit_bytes=NULL,budget_policy_version=NULL WHERE id=?",(proposed_title,proposed_body,task_id))
+        _append_event(conn,task_id,"edited",{"fields":[name for name,value in (("title",title),("body",body)) if value is not None]})
+    return True
+
+
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
@@ -3694,12 +3770,30 @@ def specify_triage_task(
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title, body, assignee, worker_max_turns, budget_exception_actor FROM tasks "
+            "WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
             return False
+        proposed_title = title.strip() if title is not None else (existing["title"] or "")
+        proposed_body = body if body is not None else (existing["body"] or "")
+        content_changed = proposed_title != (existing["title"] or "") or proposed_body != (existing["body"] or "")
+        if content_changed:
+            from hermes_cli.kanban_limits import evaluate_card_budget
+            # A prior exception authenticates the old bytes only. Content growth
+            # requires a fresh authorization; shrinking into budget clears it.
+            evaluate_card_budget(
+                proposed_title, proposed_body,
+                worker_max_turns=existing["worker_max_turns"],
+            )
         sets: list[str] = ["status = 'todo'"]
+        if content_changed and existing["budget_exception_actor"] is not None:
+            sets.extend([
+                "budget_exception_reason = NULL", "budget_exception_receipt = NULL", "budget_exception_actor = NULL",
+                "budget_exception_at = NULL", "budget_exception_measured_bytes = NULL",
+                "budget_exception_limit_bytes = NULL", "budget_policy_version = NULL",
+            ])
         params: list[Any] = []
         changed_fields: list[str] = []
         if title is not None and title.strip() != (existing["title"] or ""):
@@ -4058,6 +4152,166 @@ def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
 
 
 # --- Stats + SLA helpers ---
+
+_HARD_WORKER_OUTCOMES = frozenset({"crashed", "timed_out", "spawn_failed", "gave_up", "stale"})
+
+
+def _duration_summary(values: Iterable[int]) -> dict:
+    """Deterministic nearest-rank summary over non-negative integer seconds."""
+    import math
+
+    ordered = sorted(max(0, int(value)) for value in values)
+    if not ordered:
+        return {"count": 0, "min": None, "p50": None, "p95": None, "max": None}
+
+    def percentile(p: float) -> int:
+        return ordered[max(0, math.ceil(p * len(ordered)) - 1)]
+
+    return {
+        "count": len(ordered),
+        "min": ordered[0],
+        "p50": percentile(0.50),
+        "p95": percentile(0.95),
+        "max": ordered[-1],
+    }
+
+
+def cohort_metrics(
+    conn: sqlite3.Connection,
+    task_ids: Iterable[str],
+    *,
+    as_of: Optional[int] = None,
+) -> dict:
+    """Reproducible latency/failure metrics for an explicit cohort at a cutoff."""
+    ids = list(task_ids)
+    if not ids:
+        raise ValueError("cohort task IDs must not be empty")
+    if len(ids) != len(set(ids)):
+        raise ValueError("duplicate cohort task ID")
+    ids = sorted(ids)
+    cutoff = int(time.time()) if as_of is None else int(as_of)
+    placeholders = ",".join("?" for _ in ids)
+    tasks = conn.execute(
+        f"SELECT id, created_at, completed_at, status FROM tasks WHERE id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    found = {row["id"] for row in tasks}
+    missing = sorted(set(ids) - found)
+    if missing:
+        raise ValueError("unknown cohort task ID(s): " + ", ".join(missing))
+    if any(int(row["created_at"]) > cutoff for row in tasks):
+        raise ValueError("cohort contains task(s) not yet created at as_of")
+
+    runs = conn.execute(
+        f"SELECT id, task_id, started_at, ended_at, outcome FROM task_runs "
+        f"WHERE task_id IN ({placeholders}) AND started_at <= ? ORDER BY task_id, started_at, id",
+        (*ids, cutoff),
+    ).fetchall()
+    by_task: dict[str, list] = {task_id: [] for task_id in ids}
+    outcomes: dict[str, int] = {}
+    active_runs = 0
+    run_durations: list[int] = []
+    clock_anomalies = 0
+    for run in runs:
+        by_task[run["task_id"]].append(run)
+        if run["ended_at"] is None or int(run["ended_at"]) > cutoff:
+            active_runs += 1
+            continue
+        outcome = run["outcome"] or "unknown"
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        duration = int(run["ended_at"]) - int(run["started_at"])
+        if duration < 0:
+            clock_anomalies += 1
+        run_durations.append(max(0, duration))
+
+    first_start: list[int] = []
+    retry_delays: list[int] = []
+    tasks_with_runs = 0
+    multi_run = 0
+    first_attempt_success = 0
+    closed_first_attempts = 0
+    for task in tasks:
+        task_runs = by_task[task["id"]]
+        if not task_runs:
+            continue
+        tasks_with_runs += 1
+        first_delay = int(task_runs[0]["started_at"]) - int(task["created_at"])
+        if first_delay < 0:
+            clock_anomalies += 1
+        first_start.append(max(0, first_delay))
+        first_ended = task_runs[0]["ended_at"]
+        if first_ended is not None and int(first_ended) <= cutoff:
+            closed_first_attempts += 1
+            if task_runs[0]["outcome"] == "completed":
+                first_attempt_success += 1
+        if len(task_runs) > 1:
+            multi_run += 1
+        for previous, current in zip(task_runs, task_runs[1:]):
+            if previous["ended_at"] is None or int(previous["ended_at"]) > cutoff:
+                continue
+            delay = int(current["started_at"]) - int(previous["ended_at"])
+            if delay < 0:
+                clock_anomalies += 1
+            retry_delays.append(max(0, delay))
+
+    terminal_times: list[int] = []
+    incomplete: list[str] = []
+    terminal_kinds={"completed","archived","verified_superseded_archive"}
+    nonterminal_kinds={"reopened","unblocked","promoted","promoted_manual","claimed","review_requested","review_reopened","changes_requested","reclaimed","blocked","scheduled","dependency_wait","descendant_invalidated","specified"}
+    for task in tasks:
+        terminal=None; saw_lifecycle=False
+        events=conn.execute("SELECT kind,payload,created_at FROM task_events WHERE task_id=? AND created_at<=? ORDER BY created_at,id",(task["id"],cutoff)).fetchall()
+        for event in events:
+            kind=event["kind"]
+            if kind in terminal_kinds:
+                terminal=int(event["created_at"]);saw_lifecycle=True
+            elif kind in nonterminal_kinds:
+                terminal=None;saw_lifecycle=True
+            elif kind=="status":
+                payload=_json_dict(event["payload"])
+                status=payload.get("status")
+                if status in VALID_STATUSES:
+                    terminal=int(event["created_at"]) if status in {"done","archived"} else None
+                    saw_lifecycle=True
+        if not saw_lifecycle and task["completed_at"] is not None and int(task["completed_at"])<=cutoff:
+            terminal=int(task["completed_at"])
+        if terminal is None: incomplete.append(task["id"])
+        else: terminal_times.append(terminal)
+    cohort_wall = None
+    if not incomplete:
+        cohort_wall = max(terminal_times) - min(int(task["created_at"]) for task in tasks)
+        if cohort_wall < 0:
+            clock_anomalies += 1
+            cohort_wall = 0
+
+    completed = outcomes.get("completed", 0)
+    hard_failures = sum(outcomes.get(name, 0) for name in _HARD_WORKER_OUTCOMES)
+
+    def rate(numerator: int, denominator: int) -> dict:
+        return {"numerator": numerator, "denominator": denominator,
+                "value": numerator / denominator if denominator else None}
+
+    return {
+        "cohort_task_ids": ids, "as_of": cutoff,
+        "task_counts": {"requested": len(ids), "with_runs": tasks_with_runs,
+                        "multiple_runs": multi_run, "incomplete": len(incomplete)},
+        "incomplete_task_ids": sorted(incomplete), "active_runs": active_runs,
+        "clock_anomalies": clock_anomalies,
+        "run_outcomes": dict(sorted(outcomes.items())),
+        "durations": {
+            "run_seconds": _duration_summary(run_durations),
+            "creation_to_first_start_seconds": _duration_summary(first_start),
+            "retry_delay_seconds": _duration_summary(retry_delays),
+            "cohort_wall_seconds": cohort_wall,
+        },
+        "rates": {
+            "worker_failure": rate(hard_failures, completed + hard_failures),
+            "blocked_run": rate(outcomes.get("blocked", 0), sum(outcomes.values())),
+            "retry": rate(multi_run, tasks_with_runs),
+            "first_attempt_success": rate(first_attempt_success, closed_first_attempts),
+        },
+    }
+
 
 def board_stats(conn: sqlite3.Connection) -> dict:
     """Per-status + per-assignee counts and the oldest ``ready`` age (staleness signal)."""

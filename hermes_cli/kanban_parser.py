@@ -189,6 +189,10 @@ _SPECS = [
                   "the worker). Requires --model."),
         _arg("--completion-contract", metavar="CONTRACT",
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
+        _arg("--worker-max-turns", type=int, metavar="N", default=500,
+             help="Explicit per-card worker turn ceiling (1-500; default 500)."),
+        _arg("--budget-exception-receipt", metavar="REASON",
+             help="Local operator justification for an oversized card; recorded with actor and policy receipt."),
         _arg("--goal", action="store_true", dest="goal_mode",
              help="Run the worker in a goal loop: after each turn a judge checks the "
                   "response against the card title/body and, if not done, the worker "
@@ -367,6 +371,11 @@ _SPECS = [
         _arg("--interval", type=float, default=0.5, help="Poll interval in seconds (default: 0.5)"),
     ], help="Live-stream task_events to the terminal (Ctrl+C to exit)"),
     _cmd("stats", [_json_flag()], help="Per-status + per-assignee counts + oldest-ready age"),
+    _cmd("metrics", [
+        _arg("task_ids", nargs="+", help="Explicit cohort task IDs (membership is never inferred)"),
+        _arg("--as-of", type=int, help="Fixed epoch used in the report for reproducibility"),
+        _json_flag(),
+    ], help="Latency and failure metrics for an explicit task cohort"),
     _cmd("notify-subscribe", [
         _TASK_ID,
         *_NOTIFY_TARGET,

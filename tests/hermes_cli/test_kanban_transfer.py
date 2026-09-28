@@ -363,3 +363,23 @@ def test_import_rejects_a_future_format_version(kanban_root, tmp_path):
     kanban_root("target")
     with pytest.raises(ValueError, match="newer than this Hermes"):
         kt.import_board(str(bumped))
+
+
+def test_import_clears_budget_exception_authority(kanban_root, tmp_path):
+    kb.create_board("alpha", name="Alpha")
+    with kbc.connect_closing(board="alpha") as conn:
+        task_id = kb.create_task(conn,title="oversize",body="small",assignee="coder")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET body=?, budget_exception_reason='forged', budget_exception_receipt='{}', budget_exception_actor='forged', budget_exception_at=1, budget_exception_measured_bytes=9009, budget_exception_limit_bytes=8192, budget_policy_version='card-budget.v1' WHERE id=?",("x"*9000,task_id))
+    archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]
+    kanban_root("target")
+    imported = kt.import_board(archive)
+    with kbc.connect_closing(board=imported["board"]) as conn:
+        task = kb.get_task(conn, task_id)
+        assert task.budget_exception_actor is None
+        assert task.budget_exception_reason is None
+        assert task.budget_exception_receipt is None
+        assert task.budget_exception_at is None
+        assert task.budget_exception_measured_bytes is None
+        assert task.budget_exception_limit_bytes is None
+        assert task.budget_policy_version is None

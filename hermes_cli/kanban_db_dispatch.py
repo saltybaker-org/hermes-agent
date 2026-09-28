@@ -1997,6 +1997,42 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    # Re-check the durable row immediately before claim.  This is the
+    # non-bypassable backstop for imports, legacy DBs, direct SQL and any
+    # post-create content mutation that skipped create_task admission.
+    stored_task = _kb.get_task(conn, task_id)
+    if stored_task is None:
+        return False
+    try:
+        from hermes_cli.kanban_limits import (
+            BUDGET_POLICY_VERSION, CARD_BUDGET_BYTES, CardBudgetError,
+            validate_persisted_task_budget,
+        )
+        validate_persisted_task_budget(stored_task)
+    except CardBudgetError as exc:
+        if dry_run:
+            result.respawn_guarded.append((task_id, "budget_policy"))
+            return False
+        measured = len((stored_task.title + "\n" + (stored_task.body or "")).encode("utf-8"))
+        with _kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input', "
+                "claim_lock = NULL, claim_expires = NULL WHERE id = ? "
+                "AND status IN ('ready', 'review') AND claim_lock IS NULL",
+                (task_id,),
+            )
+            _kb._append_event(
+                conn, task_id, "budget_rejected",
+                {
+                    "reason": str(exc),
+                    "measured_bytes": measured,
+                    "limit_bytes": CARD_BUDGET_BYTES,
+                    "worker_max_turns": stored_task.worker_max_turns,
+                    "policy_version": BUDGET_POLICY_VERSION,
+                },
+            )
+        result.auto_blocked.append(task_id)
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -2660,7 +2696,10 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    cmd.extend([
+        "chat", "--max-turns", str(task.worker_max_turns),
+        "-q", f"work kanban task {task.id}",
+    ])
     # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).
     return cmd
