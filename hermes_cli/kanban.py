@@ -192,7 +192,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             return _err(f"kanban: unknown action {action!r}", 2)
         try:
             return int(handler(args) or 0)
-        except (ValueError, RuntimeError, PermissionError) as exc:
+        except PermissionError as exc:
+            return _err(f"kanban: {exc}", 2)
+        except (ValueError, RuntimeError) as exc:
             return _err(f"kanban: {exc}")
 
 
@@ -388,6 +390,41 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _cmd_construct_pipeline(args: argparse.Namespace) -> int:
+    from pathlib import Path
+    from hermes_cli import kanban_pipeline_mutation as pipeline
+    from hermes_cli.kanban_jev_gate import JevAuthorizationError
+    try:
+        manifest=pipeline.load_json_object(Path(args.manifest))
+        cards=pipeline.load_json_object(Path(args.cards))
+        with kbc.connect_closing() as conn:
+            created=pipeline.create_pipeline(conn,manifest,cards)
+    except (pipeline.PipelineConstructionError,JevAuthorizationError) as exc:
+        return _err(f"pipeline construction denied: {exc}",2)
+    if getattr(args,"json",False): _print_json(created)
+    else:
+        for key,task_id in created.items(): print(f"{key}: {task_id}")
+    return 0
+
+
+def _cmd_publish_closure(args: argparse.Namespace) -> int:
+    from pathlib import Path
+    from hermes_cli import kanban_pipeline_mutation as pipeline
+    from hermes_cli.kanban_closure_mutation import publish_closure
+    from hermes_cli.kanban_jev_gate import JevAuthorizationError
+    try:
+        evidence=pipeline.load_json_object(Path(args.evidence))
+        with kbc.connect_closing() as conn:
+            ok=publish_closure(conn,args.task_id,evidence=evidence,document=Path(args.document),result=args.result,summary=args.summary)
+    except (pipeline.PipelineConstructionError,JevAuthorizationError) as exc:
+        return _err(f"closure publication denied: {exc}",2)
+    if not ok: return _err("closure publication denied by task lifecycle",2)
+    receipt={"task_id":args.task_id,"published":True}
+    if getattr(args,"json",False): _print_json(receipt)
+    else: print(f"Published closure {args.task_id}")
     return 0
 
 
@@ -1026,7 +1063,7 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+        op = lambda tid: kb.unblock_task(conn, tid, reason=reason, author=author)
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 
@@ -1317,7 +1354,9 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 
 _HANDLERS = {
-    "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
+    "init": _cmd_init, "create": _cmd_create,
+    "construct-pipeline": _cmd_construct_pipeline, "publish-closure": _cmd_publish_closure,
+    "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,

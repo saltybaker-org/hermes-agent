@@ -219,6 +219,19 @@ _SPECS = [
                   "to skip the brief running-to-blocked transition."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
+    _cmd("construct-pipeline", [
+        _arg("manifest", help="fellowship-pipeline.v1 JSON manifest"),
+        _arg("cards", help="JSON array of complete card creation objects keyed like the manifest"),
+        _json_flag(help="Emit key-to-task-id mapping"),
+    ], help="Validate and atomically construct a complete JEV pipeline"),
+    _cmd("publish-closure", [
+        _TASK_ID,
+        _arg("evidence", help="fellowship-closure.v1 evidence JSON"),
+        _arg("document", help="Closure markdown document"),
+        _arg("--result", help="Task completion result"),
+        _arg("--summary", help="Task completion summary"),
+        _json_flag(help="Emit publication receipt"),
+    ], help="Validate closure evidence and atomically publish the closure task"),
     _cmd("swarm", [
         _arg("goal", help="Swarm goal / final outcome"),
         _arg("--worker", action="append", default=[], metavar="PROFILE:TITLE[:SKILL,SKILL]",
