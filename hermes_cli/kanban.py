@@ -375,6 +375,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
+            worker_max_turns=getattr(args, "worker_max_turns", 500),
+            budget_exception_receipt=(json.loads(Path(args.budget_exception_receipt).read_text()) if getattr(args,"budget_exception_receipt",None) else None),
             initial_status=getattr(args, "initial_status", "running"),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
@@ -1188,6 +1190,24 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_metrics(args: argparse.Namespace) -> int:
+    try:
+        with kbc.connect_closing() as conn:
+            report = kb.cohort_metrics(conn, args.task_ids, as_of=args.as_of)
+    except ValueError as exc:
+        return _err(str(exc))
+    if _json_out(args, report):
+        return 0
+    print(f"Cohort: {report['task_counts']['requested']} tasks, "
+          f"{sum(report['run_outcomes'].values())} closed runs")
+    wall = report["durations"]["cohort_wall_seconds"]
+    print(f"Wall time: {wall if wall is not None else 'incomplete'}")
+    print("Outcomes: " + ", ".join(
+        f"{name}={count}" for name, count in report["run_outcomes"].items()
+    ))
+    return 0
+
+
 def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
     delivery_metadata = {
         key: value
@@ -1370,6 +1390,7 @@ _HANDLERS = {
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
+    "metrics": _cmd_metrics,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
@@ -1387,6 +1408,7 @@ Common subcommands:
   `list` (alias `ls`)   List tasks on the current board
   `show <id>`           Task details + comments + events
   `stats`               Per-status / per-assignee counts
+  `metrics <ids...>`    Cohort latency and failure metrics
   `create <title>…`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
