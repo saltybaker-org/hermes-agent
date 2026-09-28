@@ -376,6 +376,10 @@ _SPECS = [
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
     ], help="Archive one or more tasks"),
+    _cmd("verified-archive", [
+        _arg("manifest", help="Path to a kanban-verified-archive.v1 JSON manifest"),
+        _json_flag(help="Emit the verified archival receipt as JSON"),
+    ], help="Archive a superseded rejected gate after exact evidence verification"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),
