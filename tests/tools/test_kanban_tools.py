@@ -1268,3 +1268,14 @@ def test_kanban_guidance_rejected_gate_blocks_instead_of_completes():
     assert "must call `kanban_block`" in KANBAN_GUIDANCE
     assert "Never call `kanban_complete` for a rejecting gate verdict" in KANBAN_GUIDANCE
     assert "failed gate must not promote its downstream merge or release card" in KANBAN_GUIDANCE
+
+
+def test_kanban_guidance_blocks_on_unmet_external_acceptance():
+    """Local implementation is not completion when the card still requires publication."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "The task body's acceptance criteria always win" in KANBAN_GUIDANCE
+    assert "`local-only` does not waive explicit requirements" in KANBAN_GUIDANCE
+    assert "remote-ref readback" in KANBAN_GUIDANCE
+    assert "`kanban_block(kind=\"capability\"" in KANBAN_GUIDANCE
+    assert "Never call `kanban_complete` merely because local work is done" in KANBAN_GUIDANCE
