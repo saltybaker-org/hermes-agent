@@ -227,3 +227,26 @@ def test_malformed_verified_receipt_globally_fails_closed_for_deletion(board,mut
     unrelated=kb.create_task(board,title="unrelated")
     with kb.write_txn(board): board.execute("UPDATE task_events SET payload=? WHERE id=?",(json.dumps(payload),row["id"]))
     assert kb.delete_task(board,unrelated) is False
+
+
+def test_rejected_gate_cannot_be_deleted_before_verified_archive(board):
+    task=kb.create_task(board,title="rejected gate")
+    kva.record_gate_verdict(board,task,gate_kind="security",verdict="REJECT",candidate_sha="a"*40,reviewer="github:reviewer",author="github:author")
+    assert kb.delete_task(board,task) is False
+    assert kb.get_task(board,task) is not None
+
+
+def test_malformed_gate_evidence_cannot_be_hard_deleted(board):
+    task=kb.create_task(board,title="malformed gate")
+    with kb.write_txn(board):
+        kb._append_event(board,task,"gate_verdict",{"verdict":"REJECT"})
+    assert kb.delete_task(board,task) is False
+    assert kb.get_task(board,task) is not None
+
+
+def test_approved_gate_requires_ordinary_archive_before_hard_delete(board):
+    task=kb.create_task(board,title="approved gate")
+    kva.record_gate_verdict(board,task,gate_kind="security",verdict="APPROVE",candidate_sha="a"*40,reviewer="github:reviewer",author="github:author")
+    assert kb.delete_task(board,task) is False
+    assert kb.archive_task(board,task) is True
+    assert kb.delete_archived_task(board,task) is True

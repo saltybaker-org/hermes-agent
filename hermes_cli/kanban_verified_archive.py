@@ -133,6 +133,25 @@ def _retention_receipt_task_ids(owner_id:str,payload:Any)->set[str]:
     return {owner_id,replacement,merge,*children,*ref_tasks}
 
 def hard_delete_is_protected(conn:sqlite3.Connection,task_id:str)->bool:
+    # A rejected gate may only leave the board through verified archival, whose
+    # receipt then permanently protects it. Malformed or duplicate authority
+    # evidence cannot safely establish that ordinary destructive deletion is allowed.
+    gate_rows=conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='gate_verdict' ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    if gate_rows:
+        if len(gate_rows)!=1:
+            return True
+        try:
+            gate=_gate_payload(json.loads(gate_rows[0]["payload"] or "null"),task_id)
+        except Exception:
+            return True
+        if gate["verdict"] in _REJECTED:
+            return True
+        status=conn.execute("SELECT status FROM tasks WHERE id=?",(task_id,)).fetchone()
+        if status is not None and status["status"]!="archived":
+            return True
     rows=conn.execute("SELECT task_id,payload FROM task_events WHERE kind='verified_superseded_archive'").fetchall()
     for row in rows:
         try:

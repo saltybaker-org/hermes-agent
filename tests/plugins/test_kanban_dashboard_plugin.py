@@ -1192,3 +1192,13 @@ def test_patch_title_body_clears_stale_exception_receipt(client):
         stored=kb.get_task(conn,task["id"])
         assert stored.budget_exception_receipt is None
         assert stored.budget_exception_actor is None
+
+
+def test_delete_route_cannot_erase_rejected_gate(client):
+    from hermes_cli import kanban_verified_archive as kva
+    task=client.post("/api/plugins/kanban/tasks",json={"title":"rejected gate"}).json()["task"]
+    with kbc.connect_closing() as conn:
+        kva.record_gate_verdict(conn,task["id"],gate_kind="security",verdict="REJECT",candidate_sha="a"*40,reviewer="github:reviewer",author="github:author")
+    response=client.delete(f"/api/plugins/kanban/tasks/{task['id']}")
+    assert response.status_code != 200
+    assert client.get(f"/api/plugins/kanban/tasks/{task['id']}").status_code == 200
