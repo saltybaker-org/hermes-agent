@@ -1042,6 +1042,23 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     created_at   INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS task_closure_publications (
+    task_id TEXT PRIMARY KEY,
+    evidence_json TEXT NOT NULL,
+    document_bytes BLOB NOT NULL,
+    evidence_sha256 TEXT NOT NULL,
+    document_sha256 TEXT NOT NULL,
+    authorization_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS jev_pipeline_publications (
+    feature_id TEXT PRIMARY KEY,
+    manifest_sha256 TEXT NOT NULL,
+    mapping_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+
 -- Subscription from a gateway source (platform + chat + thread) to a
 -- task. The gateway's kanban-notifier watcher tails task_events and
 -- pushes ``completed`` / ``blocked`` / ``spawn_auto_blocked`` events to
@@ -1260,6 +1277,10 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    _pipeline_capability: Any = None,
+    _task_id: Optional[str] = None, _created_at: Optional[int] = None,
+    _preview_only: bool = False, _planned_status: Optional[str] = None,
+    _planned_tenant: Optional[str] = None, _preauthorized_payload: Optional[dict] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1325,7 +1346,12 @@ def create_task(
         if row:
             return row["id"]
 
-    now = int(time.time())
+    now = int(time.time()) if _created_at is None else int(_created_at)
+    priority=int(priority)
+    max_runtime_seconds=_opt_int(max_runtime_seconds)
+    max_retries=_opt_int(max_retries)
+    goal_max_turns=_opt_int(goal_max_turns)
+    goal_mode=bool(goal_mode)
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
     # task inheriting it would point cleanup at the user's source tree.
@@ -1335,20 +1361,47 @@ def create_task(
             workspace_path = str(board_default)
 
     # Retry once on the extremely unlikely id collision.
-    for attempt in range(2):
-        task_id = _new_task_id()
+    requested_tenant=tenant
+    requested_session_id=session_id
+    def effective_session_id():
+        if requested_session_id is not None or not creator_task_id: return requested_session_id
+        row=conn.execute("SELECT session_id FROM tasks WHERE id=?",(creator_task_id,)).fetchone()
+        return row["session_id"] if row else None
+    for attempt in range(1 if _task_id is not None else 2):
+        task_id=_task_id or _new_task_id()
+        from hermes_cli.kanban_jev_gate import JevAuthorizationError,authorize_card,card_payload
+        if _planned_status is not None:
+            task_status,resolved_tenant=_planned_status,_planned_tenant
+        else:
+            task_status,resolved_tenant=initial_task_state(conn,parents,initial_status,triage,requested_tenant)
+        proposed_workspace_path=workspace_path
+        proposed_branch_name=branch_name
+        if project_obj is not None and workspace_kind=="worktree":
+            if project_repo and not proposed_workspace_path: proposed_workspace_path=os.path.join(project_repo,".worktrees",task_id)
+            if not proposed_branch_name: proposed_branch_name=_project_branch_name(project_obj,task_id,title)
+        def mutation_payload(status_value,tenant_value,session_value):
+            return card_payload(task_id,title=title.strip(),body=body,assignee=assignee,status=status_value,created_by=created_by,created_at=now,workspace_kind=workspace_kind,workspace_path=proposed_workspace_path,branch_name=proposed_branch_name,project_id=project_id,tenant=tenant_value,priority=priority,parents=list(parents),triage=triage,idempotency_key=idempotency_key,max_runtime_seconds=max_runtime_seconds,skills=skills_list,max_retries=max_retries,model_override=model_override,provider_override=provider_override,reasoning_effort=reasoning_effort,goal_mode=goal_mode,goal_max_turns=goal_max_turns,session_id=session_value,creator_task_id=creator_task_id,project_source_task_id=project_source_task_id,completion_contract=completion_contract)
+        authorized_session_id=effective_session_id()
+        authorized_payload=mutation_payload(task_status,resolved_tenant,authorized_session_id)
+        if _preview_only:
+            return authorized_payload
+        if _pipeline_capability is None:
+            authorize_card(conn,authorized_payload)
+        else:
+            from hermes_cli.kanban_pipeline_mutation import require_pipeline_capability
+            require_pipeline_capability(_pipeline_capability)
+            if not isinstance(_preauthorized_payload,dict) or _preauthorized_payload.get("mutation_sha256")!=authorized_payload["mutation_sha256"]:
+                raise JevAuthorizationError("pipeline card authorization does not match durable payload")
         try:
-            # allow_nested: graph builders compose create_task under one outer
-            # commit so the dispatcher never sees a half-built graph.
-            with write_txn(conn, allow_nested=True):
-                task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
-                # Project worktree: fresh dir under the repo + deterministic
-                # branch, instead of the random ``wt/<id>`` worker fallback.
-                if project_obj is not None and workspace_kind == "worktree":
-                    if project_repo and not workspace_path:
-                        workspace_path = os.path.join(project_repo, ".worktrees", task_id)
-                    if not branch_name:
-                        branch_name = _project_branch_name(project_obj, task_id, title)
+            with write_txn(conn,allow_nested=True):
+                current_status,current_tenant=initial_task_state(conn,parents,initial_status,triage,requested_tenant)
+                current_session_id=effective_session_id()
+                current_payload=mutation_payload(current_status,current_tenant,current_session_id)
+                if current_payload["mutation_sha256"]!=authorized_payload["mutation_sha256"]:
+                    raise JevAuthorizationError("card state changed after authorization")
+                task_status,tenant=current_status,current_tenant
+                session_id=current_session_id
+                workspace_path,branch_name=proposed_workspace_path,proposed_branch_name
 
                 conn.execute(
                     """
@@ -1366,10 +1419,10 @@ def create_task(
                         task_id, title.strip(), body, assignee, task_status, priority,
                         created_by, now, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
-                        _opt_int(max_runtime_seconds),
+                        max_runtime_seconds,
                         json.dumps(skills_list) if skills_list is not None else None,
-                        _opt_int(max_retries), model_override, provider_override, reasoning_effort,
-                        1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        max_retries, model_override, provider_override, reasoning_effort,
+                        1 if goal_mode else 0, goal_max_turns, session_id, completion_contract,
                     ),
                 )
                 for pid in parents:
@@ -2139,6 +2192,11 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
+    from hermes_cli.kanban_jev_gate import JevAuthorizationError,authorize_existing_card,assert_existing_card_authorized
+    receipts={}
+    for row in conn.execute("SELECT id FROM tasks WHERE status='blocked'").fetchall():
+        try: receipts[row["id"]]=authorize_existing_card(conn,row["id"])
+        except JevAuthorizationError: pass
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
@@ -2147,6 +2205,9 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if cur_status == "blocked":
+                try: assert_existing_card_authorized(conn,task_id,receipts.get(task_id))
+                except JevAuthorizationError: continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
                 continue
@@ -2271,7 +2332,10 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    from hermes_cli.kanban_jev_gate import authorize_existing_card,assert_existing_card_authorized
+    receipt=authorize_existing_card(conn,task_id)
     with write_txn(conn):
+        assert_existing_card_authorized(conn,task_id,receipt)
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2304,7 +2368,10 @@ def claim_review_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    from hermes_cli.kanban_jev_gate import authorize_existing_card,assert_existing_card_authorized
+    receipt=authorize_existing_card(conn,task_id)
     with write_txn(conn):
+        assert_existing_card_authorized(conn,task_id,receipt)
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2712,6 +2779,8 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
+    _closure_capability: Any = None, _closure_report: Optional[dict] = None,
+    _closure_artifacts: Optional[dict] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2726,6 +2795,10 @@ def complete_task(
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
     """
+    from hermes_cli.kanban_closure_mutation import JevAuthorizationError, require_completion_capability
+    closure_authorized = require_completion_capability(
+        conn, task_id, _closure_capability, _closure_report,
+    )
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -2775,6 +2848,18 @@ def complete_task(
             params = (*params, int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
             return False
+        if closure_authorized:
+            # Revalidate the stage binding inside the final mutation transaction.
+            require_completion_capability(conn, task_id, _closure_capability, _closure_report)
+            if not isinstance(_closure_artifacts, dict) or not isinstance(_closure_artifacts.get("evidence_json"), str) or not isinstance(_closure_artifacts.get("document_bytes"), bytes):
+                raise ValueError("closure publication artifacts are incomplete")
+            binding=_closure_report["hermes_binding"]
+            evidence_bytes=_closure_artifacts["evidence_json"].encode()
+            document_bytes=_closure_artifacts["document_bytes"]
+            if hashlib.sha256(evidence_bytes).hexdigest()!=binding.get("evidence_sha256") or hashlib.sha256(document_bytes).hexdigest()!=binding.get("document_sha256"):
+                raise JevAuthorizationError("closure artifacts do not match authorized digests")
+            conn.execute("INSERT INTO task_closure_publications(task_id,evidence_json,document_bytes,evidence_sha256,document_sha256,authorization_json,created_at) VALUES (?,?,?,?,?,?,?)",(task_id,_closure_artifacts["evidence_json"],sqlite3.Binary(_closure_artifacts["document_bytes"]),binding["evidence_sha256"],binding["document_sha256"],json.dumps(_closure_report,sort_keys=True,separators=(",",":")),now))
+            _append_event(conn, task_id, "jev_closure_authorized", {"report": _closure_report,"mutate_board": False})
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
@@ -3464,7 +3549,16 @@ def promote_task(
     if dry_run:
         return True, None
 
+    receipt=None
+    if cur_status=="blocked":
+        from hermes_cli.kanban_jev_gate import authorize_existing_card,assert_existing_card_authorized
+        receipt=authorize_existing_card(conn,task_id)
     with write_txn(conn):
+        actual = _task_status(conn, task_id)
+        if actual == "blocked":
+            assert_existing_card_authorized(conn,task_id,receipt)
+        elif actual != "todo":
+            return False, f"task {task_id} status changed during promotion"
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
@@ -3506,11 +3600,16 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None, author: Optional[str] = None) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
+    from hermes_cli.kanban_jev_gate import authorize_existing_card,assert_existing_card_authorized
+    task=get_task(conn,task_id)
+    if task is None or task.status not in {"blocked","scheduled"}: return False
+    receipt=authorize_existing_card(conn,task_id)
     now = int(time.time())
     with write_txn(conn):
+        assert_existing_card_authorized(conn,task_id,receipt)
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3539,6 +3638,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        if reason:
+            _insert_comment(conn, task_id, (author or "operator").strip() or "operator", f"UNBLOCK: {reason}", now)
         _append_event(
             conn, task_id, "unblocked",
             (

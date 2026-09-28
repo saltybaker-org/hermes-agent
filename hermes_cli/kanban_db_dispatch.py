@@ -1997,6 +1997,26 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    # Re-authorize the complete durable row immediately before claim.
+    from hermes_cli.kanban_jev_gate import JevAuthorizationError, authorize_existing_card
+    try:
+        authorize_existing_card(conn, task_id)
+    except JevAuthorizationError as exc:
+        if dry_run:
+            result.respawn_guarded.append((task_id, "jev_policy"))
+            return False
+        with _kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+                "claim_lock=NULL, claim_expires=NULL WHERE id=? "
+                "AND status IN ('ready','review') AND claim_lock IS NULL",
+                (task_id,),
+            )
+            _kb._append_event(conn, task_id, "jev_dispatch_denied", {
+                "reason": str(exc), "mutate_board": False,
+            })
+        result.auto_blocked.append(task_id)
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
