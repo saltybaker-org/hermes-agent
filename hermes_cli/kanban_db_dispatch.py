@@ -1627,25 +1627,43 @@ def check_respawn_guard(
     #    so the worker that opened the PR is still not re-spawned against it.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body, created_at FROM task_comments "
-        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
+        "SELECT id, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC, id DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         body = _kb._lossy_text(c["body"])
         if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
             continue
         events = conn.execute(
-            # Strictly after: a same-second tie stays guarded (fail closed).
-            "SELECT kind, payload FROM task_events "
-            "WHERE task_id = ? AND created_at > ? "
-            "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
-            (task_id, int(c["created_at"] or 0)),
+            "SELECT kind, payload, created_at FROM task_events "
+            "WHERE task_id = ? AND ("
+            "(created_at > ? AND kind IN ('assigned', 'changes_requested', 'review_reopened')) "
+            "OR (created_at >= ? AND kind = 'pr_continuation'))",
+            (task_id, int(c["created_at"] or 0), int(c["created_at"] or 0)),
         ).fetchall()
-        if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
+        if any(_is_handoff_after_comment(e, int(c["id"])) for e in events):
             return None
         return "active_pr"
 
     return None
+
+
+def _is_handoff_after_comment(event: sqlite3.Row, comment_id: int) -> bool:
+    """Return whether an event authorizes work after this exact PR comment.
+
+    ``created_at`` has whole-second precision, so a continuation records the
+    newest comment id visible in the same transaction. That durable sequence
+    marker permits same-second comment→continuation while preventing an older
+    continuation from authorizing a later PR comment.
+    """
+    kind = event["kind"]
+    if kind != "pr_continuation":
+        return _is_handoff_event(kind, event["payload"])
+    data = _kb._json_or(event["payload"], {})
+    if not isinstance(data, dict):
+        return False
+    marker = data.get("after_comment_id")
+    return isinstance(marker, int) and not isinstance(marker, bool) and marker >= comment_id
 
 
 def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
