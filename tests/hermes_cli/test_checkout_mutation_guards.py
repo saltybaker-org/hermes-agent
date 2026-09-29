@@ -53,6 +53,14 @@ class TestEarlyRecovery:
         monkeypatch.setattr(pm_recovery, "repair_dependencies", _boom)
         assert er.recover_if_needed(project_root=CHECKOUT_ROOT, argv=[]) is False
 
+    def test_interrupted_pull_skips_live_checkout_before_marker_probe(self, monkeypatch):
+        class ForbiddenMarkerProbe:
+            def is_file(self):
+                raise AssertionError("interrupted-pull marker probed in the live checkout")
+
+        monkeypatch.setattr(er, "interrupted_pull_marker", lambda root: ForbiddenMarkerProbe())
+        assert er.restore_interrupted_pull(project_root=CHECKOUT_ROOT) is False
+
     def test_sandboxed_root_still_recovers(self, tmp_path, monkeypatch):
         # The guard must not disable recovery for sandboxed roots: with a
         # marker present, PM repair still runs and clears the marker.
