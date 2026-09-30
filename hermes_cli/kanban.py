@@ -376,7 +376,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
             worker_max_turns=getattr(args, "worker_max_turns", 500),
-            budget_exception_receipt=(json.loads(Path(args.budget_exception_receipt).read_text()) if getattr(args,"budget_exception_receipt",None) else None),
+            budget_exception_receipt=(json.loads(Path(args.budget_exception_receipt).read_text(encoding="utf-8-sig")) if getattr(args,"budget_exception_receipt",None) else None),
             initial_status=getattr(args, "initial_status", "running"),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),

@@ -79,7 +79,7 @@ def load_json_object(path: Path):
             if key in out: raise PipelineConstructionError(f"duplicate JSON key: {key}")
             out[key]=value
         return out
-    try: value=json.loads(Path(path).read_text(encoding="utf-8"),object_pairs_hook=pairs)
+    try: value=json.loads(Path(path).read_text(encoding="utf-8-sig"),object_pairs_hook=pairs)
     except (OSError,UnicodeError,json.JSONDecodeError) as exc: raise PipelineConstructionError(f"unreadable pipeline input: {exc}") from exc
     if not isinstance(value,(dict,list)): raise PipelineConstructionError("pipeline input must be an object or array")
     return value

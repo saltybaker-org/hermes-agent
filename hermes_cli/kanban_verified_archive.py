@@ -331,6 +331,6 @@ def load_manifest(path) -> dict:
             result[key] = value
         return result
     try:
-        return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=pairs)
+        return json.loads(path.read_text(encoding="utf-8-sig"), object_pairs_hook=pairs)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise VerifiedArchiveDenied(f"unreadable archive manifest: {exc}") from exc
