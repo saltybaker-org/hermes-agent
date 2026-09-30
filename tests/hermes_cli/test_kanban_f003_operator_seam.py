@@ -15,9 +15,13 @@ def board(tmp_path):
     conn.close()
 
 def test_exact_head_continuation_orders_comment_and_event_with_same_second(board, monkeypatch):
-    tid = kb.create_task(board, title="gate", assignee="worker")
+    tid = kb.create_task(board, title="gate", body="Repository: `example/repo`", assignee="worker")
     sha = "a" * 40
     url = "https:" + "//github.com/example/repo/pull/12"
+    pr = {"url": url, "state": "OPEN", "headRefOid": sha,
+          "headRefName": "feature", "baseRepository": {"nameWithOwner": "example/repo"}}
+    seam.bind_pr_target(board, tid, pr_url=url, head_sha=sha, actor="operator",
+        run=lambda *a: json.dumps(pr))
     monkeypatch.setattr(dispatch, "check_respawn_guard", lambda conn, task_id: None)
     def spawn(conn):
         with kb.write_txn(conn):
@@ -26,7 +30,7 @@ def test_exact_head_continuation_orders_comment_and_event_with_same_second(board
         return SimpleNamespace(spawned=[(tid, "worker", "/tmp")])
     receipt = seam.continue_verified_pr(board, tid, pr_url=url, head_sha=sha,
         actor="operator", reason="read only gate", timeout=0, dispatch_fn=spawn,
-        run=lambda *a: json.dumps({"url": url, "state": "OPEN", "headRefOid": sha}))
+        run=lambda *a: json.dumps(pr))
     assert receipt["heartbeat_at"] == 123
     comments = kb.list_comments(board, tid)
     events = [e for e in kb.list_events(board, tid) if e.kind == "pr_continuation"]
@@ -34,8 +38,11 @@ def test_exact_head_continuation_orders_comment_and_event_with_same_second(board
     assert events[0].payload["after_comment_id"] == comments[0].id
 
 def test_mismatched_head_refuses_without_audit(board):
-    tid = kb.create_task(board, title="gate")
+    tid = kb.create_task(board, title="gate", body="Repository: `example/repo`")
     url = "https:" + "//github.com/example/repo/pull/12"
+    seam.bind_pr_target(board, tid, pr_url=url, head_sha="a"*40, actor="operator",
+        run=lambda *a: json.dumps({"url":url,"state":"OPEN","headRefOid":"a"*40,
+            "headRefName":"feature","baseRepository":{"nameWithOwner":"example/repo"}}))
     with pytest.raises(seam.OperatorSeamError, match="head mismatch"):
         seam.continue_verified_pr(board, tid, pr_url=url, head_sha="a"*40,
             actor="operator", reason="gate", run=lambda *a: json.dumps({"url":url,"state":"OPEN","headRefOid":"b"*40}))
@@ -107,3 +114,27 @@ def test_publish_verifies_remote_sha_before_creating_pr(board, tmp_path):
         seam.publish_and_continue(board, tid, repo=tmp_path, remote="origin", base="main",
                                   actor="operator", reason="publish", run=run)
     assert not any(c[:3] == ("gh", "pr", "create") for c in calls)
+
+
+def test_binding_refuses_pr_from_another_repository(board):
+    tid = kb.create_task(board, title="review", body="Repository: `example/repo`", assignee="worker")
+    sha = "a" * 40
+    url = "https:" + "//github.com/other/repo/pull/12"
+    with pytest.raises(seam.OperatorSeamError, match="repository"):
+        seam.bind_pr_target(board, tid, pr_url=url, head_sha=sha, actor="operator",
+            run=lambda *args, **kwargs: pytest.fail("unrelated PR should not be fetched"))
+    assert not [e for e in kb.list_events(board, tid) if e.kind == "pr_target_bound"]
+
+
+def test_same_head_on_unbound_pr_cannot_continue(board):
+    task = kb.create_task(board, title="review", body="Repository: `example/repo`")
+    bound = "https:" + "//github.com/example/repo/pull/12"
+    other = "https:" + "//github.com/example/repo/pull/13"
+    sha = "a" * 40
+    seam.bind_pr_target(board, task, pr_url=bound, head_sha=sha, actor="operator",
+        run=lambda *a: json.dumps({"url":bound,"state":"OPEN","headRefOid":sha,
+            "headRefName":"feature","baseRepository":{"nameWithOwner":"example/repo"}}))
+    with pytest.raises(seam.OperatorSeamError, match="bound card target"):
+        seam.continue_verified_pr(board, task, pr_url=other, head_sha=sha,
+            actor="operator", reason="read only", run=lambda *a: pytest.fail("unbound PR fetched"))
+    assert not [e for e in kb.list_events(board, task) if e.kind == "pr_continuation"]

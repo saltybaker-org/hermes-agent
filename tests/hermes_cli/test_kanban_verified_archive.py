@@ -14,7 +14,8 @@ def board(tmp_path, monkeypatch):
         if endpoint == "user": return {"login": "bob"}
         return {"html_url": "https:" + "//github.com/example/repo/pull/1", "merged": True,
                 "merged_at": "2026-09-30T00:00:00Z", "merged_by": {"login": "bob"},
-                "head": {"sha": "a" * 40}, "merge_commit_sha": "b" * 40}
+                "head": {"sha": "a" * 40}, "base": {"repo": {"full_name": "example/repo"}},
+                "merge_commit_sha": "b" * 40}
     monkeypatch.setattr(kva, "_gh_json", gh)
     path=tmp_path/"kanban.db"
     kbc.init_db(path)
@@ -29,11 +30,15 @@ def _fixture(conn):
     sha="a"*40; merge="b"*40
     rejected=kb.create_task(conn,title="rejected",body="x")
     replacement=kb.create_task(conn,title="replacement",body="x")
-    merge_task=kb.create_task(conn,title="merge",body="x")
+    merge_task=kb.create_task(conn,title="merge",body="Repository: `example/repo`")
     assert kb.complete_task(conn,replacement,result="replacement gate approved");assert kb.complete_task(conn,merge_task,result="merge verified");_status(conn,rejected,"blocked")
     kb.link_tasks(conn,rejected,merge_task); kb.link_tasks(conn,replacement,merge_task)
     r=kva.record_gate_verdict(conn,rejected,gate_kind="security",verdict="REJECT",candidate_sha=sha,reviewer="hermes:reviewer",author="hermes:author")
     n=kva.record_gate_verdict(conn,replacement,gate_kind="security",verdict="APPROVE",candidate_sha=sha,reviewer="hermes:other",author="hermes:author")
+    with kb.write_txn(conn):
+        kb._append_event(conn, merge_task, "pr_target_bound", {
+            "pr_url":"https:" + "//github.com/example/repo/pull/1",
+            "head_sha":sha,"repository":"example/repo","head_ref":"feature","actor":"operator"})
     m=kva.record_merge_evidence(conn,merge_task,candidate_sha=sha,pr_url="https:" + "//github.com/example/repo/pull/1")
     manifest={"schema_version":kva.SCHEMA_VERSION,"gate_kind":"security","rejected_task_id":rejected,
       "replacement_task_id":replacement,"replacement_verdict":"APPROVE","candidate_sha":sha,
@@ -295,10 +300,15 @@ def test_archiver_identity_cannot_be_substituted_in_manifest(board):
 
 
 def test_claimed_human_name_does_not_impersonate_merged_by(board, monkeypatch):
-    merge_task = kb.create_task(board, title="merge", body="x")
+    merge_task = kb.create_task(board, title="merge", body="Repository: `example/repo`")
+    with kb.write_txn(board):
+        kb._append_event(board, merge_task, "pr_target_bound", {
+            "pr_url":"https:" + "//github.com/example/repo/pull/1", "head_sha":"a"*40,
+            "repository":"example/repo", "head_ref":"feature", "actor":"operator"})
     monkeypatch.setattr(kva, "_gh_json", lambda endpoint: {"html_url": "https:" + "//github.com/example/repo/pull/1",
         "merged": True, "merged_at": "2026-09-30T00:00:00Z", "merged_by": {"login": "bot"},
-        "head": {"sha": "a"*40}, "merge_commit_sha": "b"*40})
+        "head": {"sha": "a"*40}, "base": {"repo": {"full_name": "example/repo"}},
+         "merge_commit_sha": "b"*40})
     with pytest.raises(kva.VerifiedArchiveDenied, match="configured human"):
         kva.record_merge_evidence(board, merge_task, candidate_sha="a"*40,
             pr_url="https:" + "//github.com/example/repo/pull/1")
@@ -334,7 +344,11 @@ def test_merge_collector_cli_response_digest_and_worker_denial(board, monkeypatc
     import argparse
     from contextlib import contextmanager
     from hermes_cli import kanban as cli
-    task = kb.create_task(board, title="merge receipt", body="x")
+    task = kb.create_task(board, title="merge receipt", body="Repository: `example/repo`")
+    with kb.write_txn(board):
+        kb._append_event(board, task, "pr_target_bound", {
+            "pr_url":"https:" + "//github.com/example/repo/pull/1", "head_sha":"a"*40,
+            "repository":"example/repo", "head_ref":"feature", "actor":"operator"})
     @contextmanager
     def connection():
         yield board
@@ -351,3 +365,11 @@ def test_merge_collector_cli_response_digest_and_worker_denial(board, monkeypatc
     monkeypatch.setenv("HERMES_KANBAN_TASK", "worker")
     assert cli._cmd_collect_human_merge(args) == 2
     assert kva._event_payload(board, other, "human_merge_verified") is None
+
+
+def test_human_merge_evidence_requires_this_cards_pr_binding(board):
+    task = kb.create_task(board, title="merge", body="Repository: `example/repo`")
+    with pytest.raises(kva.VerifiedArchiveDenied, match="binding"):
+        kva.record_merge_evidence(board, task, candidate_sha="a"*40,
+            pr_url="https:" + "//github.com/example/repo/pull/1")
+    assert kva._event_payload(board, task, "human_merge_verified") is None

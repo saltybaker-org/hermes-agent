@@ -28,7 +28,7 @@ def test_resolve_triage_records_run_comment_and_events(board):
     assert board.execute("SELECT result FROM tasks WHERE id=?", (task,)).fetchone()["result"] == result["verdict"]
     assert board.execute("SELECT COUNT(*) FROM task_runs WHERE task_id=? AND outcome='completed'", (task,)).fetchone()[0] == 1
 
-@pytest.mark.parametrize("verdict,reason", [("FAIL","reason"),("REJECT","reason"),("PASS", ""),("", "reason")])
+@pytest.mark.parametrize("verdict,reason", [("FAIL","reason"),("REJECT","reason"),("DENIED","reason"),("PASS maybe","reason"),("PASS", ""),("", "reason")])
 def test_refuses_rejection_or_empty_proof(board, verdict, reason):
     task = triage(board)
     with pytest.raises(tr.TriageResolutionDenied):

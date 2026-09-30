@@ -362,6 +362,10 @@ _SPECS = [
     _cmd("operator-wake", [
         _TASK_ID, _arg("reason", nargs="+", help="Audited reason for waking typed operator wait"),
     ], help="Unblock an operator_wait card, dispatch and verify heartbeat"),
+    _cmd("operator-bind-pr", [
+        _TASK_ID, _arg("--pr-url", required=True), _arg("--head-sha", required=True),
+        _arg("reason", nargs="+", help="Why this PR is the immutable target of this card"),
+    ], help="Bind an exact GitHub PR to the card's declared repository"),
     _cmd("operator-continue-pr", [
         _TASK_ID, _arg("--pr-url", required=True), _arg("--head-sha", required=True),
         _arg("reason", nargs="+", help="Scoped reason to continue exact open PR"),

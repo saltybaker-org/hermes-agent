@@ -13,3 +13,23 @@ Use the actual merged upstream ref and paths for that board. Dispatch checks the
 These commands are operator-only. They never approve, merge, deploy, enter secrets, or complete a human gate. The board needs its normal notifier subscription for wake delivery; an un-subscribed board still records the typed block but cannot deliver a chat ping.
 
 Fellowship JEV `check-workspace` also accepts `--require-registered --upstream <ref> --require-path <relative>` (repeatable). It remains a separate CLI preflight; Hermes verifies equivalent git invariants locally because the sandboxed policy evaluator cannot read arbitrary host worktrees.
+
+## Exact PR target and credential boundary
+
+Cards using the audited wrappers declare `Repository: ` followed by a backtick-
+quoted `owner/repo` in their immutable body. The operator first runs
+`hermes kanban operator-bind-pr <id> --pr-url <exact-url> --head-sha <40-hex> "<reason>"`
+on ready/todo review and human-merge cards. It reads the PR from GitHub and
+records one immutable `pr_target_bound` event matching the card repository,
+base repository, branch (if declared), and head. `operator-continue-pr` and
+`collect-human-merge` refuse an absent, mismatched, or duplicate binding;
+the latter also reads GitHub's actual `merged_by` and exact head. Publication
+binds its newly created PR before continuation. A head move requires a new
+card and fresh exact-head gates; a binding cannot be rewritten.
+
+Only an operator process with separately held GitHub credentials may execute
+these commands. Worker containers must have **no host CLI/gh credential or
+board-database write access**; an environment variable alone is not an
+identity boundary. The collector records a real human merge; it does not
+perform the merge or supply Bob's approval. Do not enable these commands in a
+shared-credential worker runtime.
