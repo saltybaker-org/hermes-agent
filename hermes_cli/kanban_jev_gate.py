@@ -58,6 +58,7 @@ def _sandbox_argv(command:list[str],args:list[str],directory:Path)->list[str]:
     argv=[bwrap,"--die-with-parent","--new-session","--unshare-net","--unshare-pid","--clearenv",
           "--ro-bind","/usr","/usr","--ro-bind","/bin","/bin","--ro-bind","/lib","/lib"]
     if Path("/lib64").exists(): argv += ["--ro-bind","/lib64","/lib64"]
+    # no-tmp: ok — bubblewrap gives the isolated evaluator a private tmpfs, not host scratch.
     argv += ["--dev","/dev","--proc","/proc","--tmpfs","/tmp","--bind",str(directory),"/work",
              "--chdir","/work","--setenv","HOME","/work","--setenv","PATH","/usr/local/bin:/usr/bin:/bin",
              "--setenv","LANG","C.UTF-8","--"]
