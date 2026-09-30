@@ -1089,6 +1089,27 @@ def _cmd_continue_pr(args: argparse.Namespace) -> int:
     )
 
 
+def _cmd_operator_seam(args: argparse.Namespace) -> int:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("operator seam is orchestrator-only")
+    from hermes_cli import kanban_operator_seam as seam
+    try:
+        with kbc.connect_closing() as conn:
+            reason = _joined_words(args.reason)
+            if args.kanban_action == "operator-wake":
+                receipt = seam.wake_operator_wait(conn, args.task_id, reason=reason)
+            elif args.kanban_action == "operator-continue-pr":
+                receipt = seam.continue_verified_pr(conn, args.task_id,
+                    pr_url=args.pr_url, head_sha=args.head_sha, actor=_profile_author(), reason=reason)
+            else:
+                receipt = seam.publish_and_continue(conn, args.task_id, repo=args.repo,
+                    remote=args.remote, base=args.base, actor=_profile_author(), reason=reason)
+        print(json.dumps(receipt, sort_keys=True))
+        return 0
+    except (seam.OperatorSeamError, OSError, ValueError) as exc:
+        return _err(f"operator seam failed: {exc}")
+
+
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
     summary = _stripped_or_none(getattr(args, "summary", None))
@@ -1420,7 +1441,8 @@ _HANDLERS = {
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
-    "schedule": _cmd_schedule, "unblock": _cmd_unblock, "continue-pr": _cmd_continue_pr,
+    "schedule": _cmd_schedule, "unblock": _cmd_unblock, "continue-pr": _cmd_continue_pr, "operator-wake": _cmd_operator_seam,
+    "operator-continue-pr": _cmd_operator_seam, "operator-publish-pr": _cmd_operator_seam,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "verified-archive": _cmd_verified_archive,

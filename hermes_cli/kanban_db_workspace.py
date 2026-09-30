@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
+import json
 
 from hermes_cli.worktree_ops import release_lsp_clients
 
@@ -578,6 +579,58 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         )
     _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
+
+
+def preflight_registered_worktree(task: Task, workspace: Path, *, board: Optional[str] = None, conn: Optional[sqlite3.Connection] = None) -> dict:
+    """Fail closed on stale/grafted worktrees before any worker is spawned.
+
+    Board metadata `workspace_preflight` supplies `upstream_ref` and
+    `required_paths`. This contract is mandatory for JEV-gated worktree cards;
+    no guessed upstream or silently missing path list is accepted.
+    """
+    from hermes_cli.kanban_jev_gate import JevAuthorizationError
+    if conn is not None:
+        row = next((r for r in conn.execute("PRAGMA database_list") if r[1] == "main"), None)
+        try:
+            metadata = json.loads((Path(row[2]).parent / "board.json").read_text()) if row else {}
+        except (OSError, ValueError) as exc:
+            raise JevAuthorizationError("workspace preflight board metadata unavailable") from exc
+    else:
+        metadata = _kb.read_board_metadata(board if board else _kb.get_current_board())
+    cfg = metadata.get("workspace_preflight")
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("upstream_ref"), str) or not cfg["upstream_ref"]:
+        raise JevAuthorizationError("worktree preflight requires board workspace_preflight.upstream_ref")
+    paths = cfg.get("required_paths")
+    if not isinstance(paths, list) or not paths or any(not isinstance(x, str) or not x or x.startswith("/") or ".." in Path(x).parts for x in paths):
+        raise JevAuthorizationError("worktree preflight requires safe nonempty required_paths")
+    workspace = workspace.resolve(strict=True)
+    def git(*args):
+        result = _git(workspace, *args, timeout=30)
+        if result.returncode:
+            raise JevAuthorizationError("worktree preflight git check failed: " + " ".join(args[:2]))
+        return result.stdout.strip()
+    if not workspace.is_dir() or not (workspace / ".git").is_file():
+        raise JevAuthorizationError("workspace is not a linked worktree")
+    if Path(git("rev-parse", "--show-toplevel")).resolve() != workspace:
+        raise JevAuthorizationError("workspace is not its checkout root")
+    # `git rev-parse` can succeed for a deleted/unregistered .git pointer in
+    # some git versions; check the common repository's authoritative registry.
+    registered = git("worktree", "list", "--porcelain").splitlines()
+    if f"worktree {workspace}" not in registered:
+        raise JevAuthorizationError("workspace is not registered")
+    branch = git("symbolic-ref", "--quiet", "--short", "HEAD")
+    if branch != ((task.branch_name or "").strip() or f"wt/{task.id}"):
+        raise JevAuthorizationError("worktree branch mismatch")
+    head = git("rev-parse", "HEAD")
+    upstream = git("rev-parse", "--verify", cfg["upstream_ref"] + "^{commit}")
+    git("merge-base", "--is-ancestor", upstream, head)
+    if git("status", "--porcelain"):
+        raise JevAuthorizationError("worktree is dirty")
+    for relative in paths:
+        target = (workspace / relative).resolve(strict=False)
+        if not target.is_relative_to(workspace) or not target.exists():
+            raise JevAuthorizationError("worktree missing required path: " + relative)
+    return {"branch": branch, "head": head, "upstream": upstream, "required_paths": paths}
 
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:

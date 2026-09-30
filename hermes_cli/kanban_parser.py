@@ -353,6 +353,18 @@ _SPECS = [
         _TASK_ID,
         _arg("reason", nargs="+", help="Why work should resume on the existing PR"),
     ], help="Explicitly authorize a ready task to continue work on its existing PR"),
+    _cmd("operator-wake", [
+        _TASK_ID, _arg("reason", nargs="+", help="Audited reason for waking typed operator wait"),
+    ], help="Unblock an operator_wait card, dispatch and verify heartbeat"),
+    _cmd("operator-continue-pr", [
+        _TASK_ID, _arg("--pr-url", required=True), _arg("--head-sha", required=True),
+        _arg("reason", nargs="+", help="Scoped reason to continue exact open PR"),
+    ], help="Verify exact open PR head, authorize, dispatch and verify heartbeat"),
+    _cmd("operator-publish-pr", [
+        _TASK_ID, _arg("--repo", required=True), _arg("--remote", required=True),
+        _arg("--base", required=True),
+        _arg("reason", nargs="+", help="Scoped publication reason"),
+    ], help="Push exact card branch, create PR and verify audited continuation"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),

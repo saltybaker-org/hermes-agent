@@ -2181,12 +2181,29 @@ def _dispatch_lane_task(
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
+        if claimed.workspace_kind == "worktree":
+            from hermes_cli.kanban_jev_gate import _config as _jev_config
+            if _jev_config(conn) is not None:
+                _kb.block_task(conn, claimed.id, kind="needs_input", reason=f"workspace resolution: {exc}")
+                result.auto_blocked.append(claimed.id)
+                return False
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
         ):
             result.auto_blocked.append(claimed.id)
         return False
+    # Re-resolve and verify the registered checkout before model work. A stale
+    # worktree is an operator repair, not a worker retry budget failure.
+    if claimed.workspace_kind == "worktree":
+        from hermes_cli.kanban_jev_gate import _config as _jev_config
+        try:
+            if _jev_config(conn) is not None:
+                _kbw.preflight_registered_worktree(claimed, workspace, board=board, conn=conn)
+        except Exception as exc:
+            _kb.block_task(conn, claimed.id, kind="needs_input", reason=f"workspace preflight: {exc}")
+            result.auto_blocked.append(claimed.id)
+            return False
     _kbw.set_workspace_path(conn, claimed.id, str(workspace))
     if claimed.workspace_kind == "worktree":
         _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
