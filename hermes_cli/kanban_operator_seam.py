@@ -13,7 +13,7 @@ class OperatorSeamError(RuntimeError):
     pass
 
 def command(*argv, cwd=None):
-    result = subprocess.run(argv, cwd=cwd, text=True, capture_output=True, timeout=60)
+    result = subprocess.run(argv, cwd=cwd, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=60)
     if result.returncode:
         raise OperatorSeamError("operator command failed: " + argv[0])
     return result.stdout.strip()

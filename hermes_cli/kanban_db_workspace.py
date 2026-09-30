@@ -592,7 +592,7 @@ def preflight_registered_worktree(task: Task, workspace: Path, *, board: Optiona
     if conn is not None:
         row = next((r for r in conn.execute("PRAGMA database_list") if r[1] == "main"), None)
         try:
-            metadata = json.loads((Path(row[2]).parent / "board.json").read_text()) if row else {}
+            metadata = json.loads((Path(row[2]).parent / "board.json").read_text(encoding="utf-8-sig")) if row else {}
         except (OSError, ValueError) as exc:
             raise JevAuthorizationError("workspace preflight board metadata unavailable") from exc
     else:
