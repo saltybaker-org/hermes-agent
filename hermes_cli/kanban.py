@@ -211,8 +211,8 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "request-review", "request-changes", "reopen-review", "continue-pr",
-    "gc",
+    "request-review", "request-changes", "reopen-review", "continue-pr", "resolve-triage",
+    "gc", "verified-archive", "archive-manifest", "collect-human-merge", "publish-closure",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
@@ -1074,6 +1074,23 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 
 
+def _cmd_resolve_triage(args: argparse.Namespace) -> int:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban resolve-triage is operator-only", 2)
+    from hermes_cli.kanban_triage_resolution import resolve_triage, TriageResolutionDenied
+    try:
+        with kbc.connect_closing() as conn:
+            receipt = resolve_triage(conn, args.task_id, verdict=args.verdict,
+                                     reason=args.reason, actor=_profile_author())
+    except TriageResolutionDenied as exc:
+        return _err(f"triage resolution denied: {exc}", 2)
+    if getattr(args, "json", False):
+        _print_json(receipt)
+    else:
+        print(f"Resolved triage {args.task_id}: {receipt['verdict']}")
+    return 0
+
+
 def _cmd_continue_pr(args: argparse.Namespace) -> int:
     if os.environ.get("HERMES_KANBAN_TASK"):
         return _err("kanban continue-pr is orchestrator-only")
@@ -1212,9 +1229,43 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
 
 
+def _cmd_collect_human_merge(args: argparse.Namespace) -> int:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("human merge collection is operator-only", 2)
+    from hermes_cli import kanban_verified_archive as kva
+    try:
+        with kbc.connect_closing() as conn:
+            event_id = kva.record_merge_evidence(conn, args.task_id,
+                candidate_sha=args.candidate_sha, pr_url=args.pr_url)
+            evidence = kva._event_payload(conn, args.task_id, "human_merge_verified")[1]
+    except kva.VerifiedArchiveDenied as exc:
+        return _err(f"human merge collection denied: {exc}", 2)
+    receipt = {"task_id": args.task_id, "event_id": event_id,
+               "evidence": evidence, "evidence_sha256": kva._digest(evidence)}
+    if getattr(args, "json", False): _print_json(receipt)
+    else: print(f"Collected authenticated human merge for {args.task_id} (event {event_id})")
+    return 0
+
+
+def _cmd_archive_manifest(args: argparse.Namespace) -> int:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("archive manifest is operator-only", 2)
+    from hermes_cli import kanban_verified_archive as kva
+    try:
+        with kbc.connect_closing() as conn:
+            manifest = kva.build_archive_manifest(conn, args.rejected_task_id,
+                args.replacement_task_id, args.merge_task_id)
+    except kva.VerifiedArchiveDenied as exc:
+        return _err(f"archive manifest denied: {exc}", 2)
+    _print_json(manifest)
+    return 0
+
+
 def _cmd_verified_archive(args: argparse.Namespace) -> int:
     from pathlib import Path
     from hermes_cli import kanban_verified_archive as kva
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("verified archive is operator-only", 2)
     try:
         manifest = kva.load_manifest(Path(args.manifest))
         with kbc.connect_closing() as conn:
@@ -1441,11 +1492,13 @@ _HANDLERS = {
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
-    "schedule": _cmd_schedule, "unblock": _cmd_unblock, "continue-pr": _cmd_continue_pr, "operator-wake": _cmd_operator_seam,
+    "schedule": _cmd_schedule, "unblock": _cmd_unblock, "resolve-triage": _cmd_resolve_triage,
+    "continue-pr": _cmd_continue_pr, "operator-wake": _cmd_operator_seam,
     "operator-continue-pr": _cmd_operator_seam, "operator-publish-pr": _cmd_operator_seam,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "verified-archive": _cmd_verified_archive,
+    "archive-manifest": _cmd_archive_manifest, "collect-human-merge": _cmd_collect_human_merge,
     "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "metrics": _cmd_metrics,
