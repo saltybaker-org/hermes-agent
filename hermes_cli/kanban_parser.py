@@ -349,6 +349,12 @@ _SPECS = [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    _cmd("resolve-triage", [
+        _TASK_ID,
+        _arg("--verdict", required=True, help="Recorded successful verdict (never a rejecting gate)"),
+        _arg("--reason", required=True, help="Auditable operator rationale"),
+        _json_flag(),
+    ], help="Resolve a triaged card with a documented successful verdict"),
     _cmd("continue-pr", [
         _TASK_ID,
         _arg("reason", nargs="+", help="Why work should resume on the existing PR"),
@@ -392,8 +398,15 @@ _SPECS = [
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
     ], help="Archive one or more tasks"),
+    _cmd("collect-human-merge", [
+        _TASK_ID, _arg("--pr-url", required=True), _arg("--candidate-sha", required=True),
+        _json_flag(),
+    ], help="Read GitHub merged_by (HERMES_KANBAN_HUMAN_MERGE_LOGIN) and record immutable evidence"),
+    _cmd("archive-manifest", [
+        _arg("rejected_task_id"), _arg("replacement_task_id"), _arg("merge_task_id"),
+    ], help="Print a graph-enumerated manifest (requires HERMES_KANBAN_ARCHIVE_AUTHORIZED_LOGINS and authenticated gh)"),
     _cmd("verified-archive", [
-        _arg("manifest", help="Path to a kanban-verified-archive.v1 JSON manifest"),
+        _arg("manifest", help="Path to a kanban-verified-archive.v2 JSON manifest"),
         _json_flag(help="Emit the verified archival receipt as JSON"),
     ], help="Archive a superseded rejected gate after exact evidence verification"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
