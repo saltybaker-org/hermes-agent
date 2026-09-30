@@ -666,6 +666,23 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
+    db_path = d / "kanban.db"
+    if db_path.exists():
+        # Board-level rename/delete must not bypass per-card gate retention.
+        # Permanent deletion is restricted to empty boards: archival preserves
+        # the database and evidence, whereas rmtree destroys it wholesale.
+        from hermes_cli.kanban_verified_archive import assert_ordinary_archive_allowed
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as guard:
+            guard.row_factory = sqlite3.Row
+            rows = guard.execute("SELECT id,status FROM tasks").fetchall()
+            if rows and not archive:
+                raise ValueError("nonempty boards cannot be permanently deleted; archive instead")
+            for row in rows:
+                if row["status"] not in {"done", "archived"}:
+                    raise ValueError("board has nonterminal tasks; retire them before archiving")
+                if row["status"] == "done":
+                    assert_ordinary_archive_allowed(guard, row["id"])
+
     # If the user removed the currently-active board, revert to default.
     if get_current_board() == normed:
         clear_current_board()

@@ -1115,6 +1115,9 @@ def _cmd_operator_seam(args: argparse.Namespace) -> int:
             reason = _joined_words(args.reason)
             if args.kanban_action == "operator-wake":
                 receipt = seam.wake_operator_wait(conn, args.task_id, reason=reason)
+            elif args.kanban_action == "operator-bind-pr":
+                receipt = seam.bind_pr_target(conn, args.task_id,
+                    pr_url=args.pr_url, head_sha=args.head_sha, actor=_profile_author())
             elif args.kanban_action == "operator-continue-pr":
                 receipt = seam.continue_verified_pr(conn, args.task_id,
                     pr_url=args.pr_url, head_sha=args.head_sha, actor=_profile_author(), reason=reason)
@@ -1494,7 +1497,8 @@ _HANDLERS = {
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock, "resolve-triage": _cmd_resolve_triage,
     "continue-pr": _cmd_continue_pr, "operator-wake": _cmd_operator_seam,
-    "operator-continue-pr": _cmd_operator_seam, "operator-publish-pr": _cmd_operator_seam,
+    "operator-continue-pr": _cmd_operator_seam, "operator-bind-pr": _cmd_operator_seam,
+    "operator-publish-pr": _cmd_operator_seam,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "verified-archive": _cmd_verified_archive,

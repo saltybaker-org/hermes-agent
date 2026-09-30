@@ -16,8 +16,9 @@ def resolve_triage(conn, task_id: str, *, verdict: str, reason: str, actor: str)
         raise TriageResolutionDenied("a non-empty verdict and operator reason are required")
     if not isinstance(actor, str) or not actor.strip():
         raise TriageResolutionDenied("an operator identity is required")
-    if verdict.strip().upper() in {"FAIL", "REJECT", "REQUEST_CHANGES"}:
-        raise TriageResolutionDenied("rejecting verdicts cannot satisfy dependencies")
+    label, marker, detail = verdict.strip().partition(":")
+    if label.upper() not in {"PASS", "APPROVE", "DONE", "COMPLETE", "RESOLVED"} or (marker and not detail.strip()):
+        raise TriageResolutionDenied("only an explicit successful verdict can satisfy dependencies")
     with kb.write_txn(conn):
         task = kb.get_task(conn, task_id)
         if task is None or task.status != "triage" or task.current_run_id is not None:

@@ -118,7 +118,9 @@ def collect_human_merge(pr_url: str, candidate_sha: str) -> dict:
     merged_login = merged_by.get("login") if isinstance(merged_by, dict) else None
     commit = pr.get("merge_commit_sha")
     head = pr.get("head")
+    base_repo = (pr.get("base") or {}).get("repo") or {}
     if (pr.get("html_url") != pr_url or pr.get("merged") is not True or
+        base_repo.get("full_name", "").lower() != match[1].lower() or
         not pr.get("merged_at") or not isinstance(head, dict) or head.get("sha") != candidate_sha or
         not isinstance(commit, str) or not _SHA.fullmatch(commit) or
         not isinstance(merged_login, str) or merged_login.lower() != expected):
@@ -129,6 +131,21 @@ def collect_human_merge(pr_url: str, candidate_sha: str) -> dict:
 
 def record_merge_evidence(conn: sqlite3.Connection, task_id: str, *,
                           candidate_sha: str, pr_url: str) -> int:
+    from hermes_cli.kanban_operator_seam import _card_repository, OperatorSeamError
+    task = kb.get_task(conn, task_id)
+    if task is None:
+        raise VerifiedArchiveDenied("unknown merge task")
+    rows = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='pr_target_bound' ORDER BY id", (task_id,)).fetchall()
+    if len(rows) != 1:
+        raise VerifiedArchiveDenied("exactly one prior PR target binding is required")
+    try:
+        binding = json.loads(rows[0]["payload"])
+        repo = _card_repository(task)
+    except (ValueError, TypeError, OperatorSeamError) as exc:
+        raise VerifiedArchiveDenied("invalid PR target binding") from exc
+    if (binding.get("pr_url") != pr_url or binding.get("head_sha") != candidate_sha or
+        binding.get("repository") != repo):
+        raise VerifiedArchiveDenied("merge PR differs from bound card target")
     receipt = collect_human_merge(pr_url, candidate_sha)
     with kb.write_txn(conn):
         if kb.get_task(conn, task_id) is None:
