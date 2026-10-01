@@ -6,7 +6,6 @@ import os
 import sqlite3
 import subprocess
 import tempfile
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -53,9 +52,13 @@ def _trusted_command()->list[str]:
     return [str(path)]
 
 def _sandbox_argv(command:list[str],args:list[str],directory:Path)->list[str]:
-    bwrap=shutil.which("bwrap")
-    if not bwrap: raise JevAuthorizationError("JEV sandbox is unavailable")
-    argv=[bwrap,"--die-with-parent","--new-session","--unshare-net","--unshare-pid","--clearenv",
+    # A PATH-selected executable is attacker-controlled, not a sandbox boundary.
+    bwrap=Path("/usr/bin/bwrap")
+    try: binary_stat=bwrap.stat()
+    except OSError as exc: raise JevAuthorizationError("JEV sandbox is unavailable") from exc
+    if binary_stat.st_uid!=0 or binary_stat.st_mode & 0o022 or not bwrap.is_file():
+        raise JevAuthorizationError("JEV sandbox executable ownership is unsafe")
+    argv=[str(bwrap),"--die-with-parent","--new-session","--unshare-net","--unshare-pid","--clearenv",
           "--ro-bind","/usr","/usr","--ro-bind","/bin","/bin","--ro-bind","/lib","/lib"]
     if Path("/lib64").exists(): argv += ["--ro-bind","/lib64","/lib64"]
     # no-tmp: ok — bubblewrap gives the isolated evaluator a private tmpfs, not host scratch.

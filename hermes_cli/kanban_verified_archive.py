@@ -8,6 +8,7 @@ import os
 import hashlib
 import subprocess
 from typing import Any
+from pathlib import Path
 
 from hermes_cli import kanban_db as kb
 
@@ -95,10 +96,50 @@ def _gh_json(endpoint: str) -> dict:
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         raise VerifiedArchiveDenied("authenticated GitHub read failed") from exc
 
+def _policy_path() -> Path:
+    # Do not allow a caller-controlled HERMES_HOME/HOME or board.json to appoint
+    # its own archiver. This Linux operator policy is outside worker mounts.
+    if os.name != "posix":
+        raise VerifiedArchiveDenied("archive authority policy requires a protected POSIX host")
+    import pwd
+    return Path(pwd.getpwuid(getattr(os, "getuid")()).pw_dir) / ".hermes" / "kanban" / "archive-authority.json"
+
+
+def _archive_policy() -> dict:
+    import stat
+    path = _policy_path()
+    try:
+        parent = path.parent.stat()
+        if parent.st_uid != getattr(os, "getuid")() or parent.st_mode & 0o077:
+            raise VerifiedArchiveDenied("archive authority policy directory is not owner-only")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != getattr(os, "getuid")() or info.st_mode & 0o077 or info.st_size > 4096:
+                raise VerifiedArchiveDenied("archive authority policy file is not owner-only")
+            raw = stream.read(4097)
+        if len(raw) > 4096:
+            raise VerifiedArchiveDenied("archive authority policy exceeds size limit")
+        def pairs(items):
+            result = {}
+            for key, value in items:
+                if key in result:
+                    raise ValueError("duplicate authority field")
+                result[key] = value
+            return result
+        policy = json.loads(raw.decode("utf-8-sig"), object_pairs_hook=pairs)
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        raise VerifiedArchiveDenied("archive authority policy is unavailable or malformed") from exc
+    allowed = policy.get("authorized_logins") if isinstance(policy, dict) else None
+    human = policy.get("human_merge_login") if isinstance(policy, dict) else None
+    valid = lambda login: isinstance(login, str) and re.fullmatch(r"[A-Za-z0-9-]{1,39}", login)
+    if not isinstance(allowed, list) or not allowed or not all(valid(x) for x in allowed) or not valid(human):
+        raise VerifiedArchiveDenied("archive authority policy has invalid principals")
+    return {"authorized_logins": {x.lower() for x in allowed}, "human_merge_login": human.lower()}
+
+
 def _authorized_login() -> str:
-    allowed = {x.strip().lower() for x in os.environ.get("HERMES_KANBAN_ARCHIVE_AUTHORIZED_LOGINS", "").split(",") if x.strip()}
-    if not allowed:
-        raise VerifiedArchiveDenied("archive authorizer allowlist is not configured")
+    allowed = _archive_policy()["authorized_logins"]
     login = _gh_json("user").get("login")
     if not isinstance(login, str) or login.lower() not in allowed:
         raise VerifiedArchiveDenied("authenticated GitHub caller is not an authorized archiver")
@@ -110,9 +151,7 @@ def collect_human_merge(pr_url: str, candidate_sha: str) -> dict:
     match = re.fullmatch(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)", pr_url[len(prefix):]) if isinstance(pr_url, str) and pr_url.startswith(prefix) else None
     if not match or not isinstance(candidate_sha, str) or not _SHA.fullmatch(candidate_sha):
         raise VerifiedArchiveDenied("exact GitHub PR URL and candidate SHA required")
-    expected = os.environ.get("HERMES_KANBAN_HUMAN_MERGE_LOGIN", "").strip().lower()
-    if not expected:
-        raise VerifiedArchiveDenied("human merge login is not configured")
+    expected = _archive_policy()["human_merge_login"]
     pr = _gh_json(f"repos/{match[1]}/pulls/{match[2]}")
     merged_by = pr.get("merged_by")
     merged_login = merged_by.get("login") if isinstance(merged_by, dict) else None

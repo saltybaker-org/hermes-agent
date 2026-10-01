@@ -374,7 +374,7 @@ _SPECS = [
         _TASK_ID, _arg("--repo", required=True), _arg("--remote", required=True),
         _arg("--base", required=True),
         _arg("reason", nargs="+", help="Scoped publication reason"),
-    ], help="Push exact card branch, create PR and verify audited continuation"),
+    ], help="Disabled: publish in trusted operator checkout, then bind and continue exact PR"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),
@@ -405,10 +405,10 @@ _SPECS = [
     _cmd("collect-human-merge", [
         _TASK_ID, _arg("--pr-url", required=True), _arg("--candidate-sha", required=True),
         _json_flag(),
-    ], help="Read GitHub merged_by (HERMES_KANBAN_HUMAN_MERGE_LOGIN) and record immutable evidence"),
+    ], help="Read GitHub merged_by under owner-only archive policy and record immutable evidence"),
     _cmd("archive-manifest", [
         _arg("rejected_task_id"), _arg("replacement_task_id"), _arg("merge_task_id"),
-    ], help="Print a graph-enumerated manifest (requires HERMES_KANBAN_ARCHIVE_AUTHORIZED_LOGINS and authenticated gh)"),
+    ], help="Print graph-enumerated manifest (requires owner-only archive policy and authenticated gh)"),
     _cmd("verified-archive", [
         _arg("manifest", help="Path to a kanban-verified-archive.v2 JSON manifest"),
         _json_flag(help="Emit the verified archival receipt as JSON"),

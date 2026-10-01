@@ -20,7 +20,7 @@ def test_exact_head_continuation_orders_comment_and_event_with_same_second(board
     url = "https:" + "//github.com/example/repo/pull/12"
     pr = {"url": url, "state": "OPEN", "headRefOid": sha,
           "headRefName": "feature", "baseRepository": {"nameWithOwner": "example/repo"}}
-    seam.bind_pr_target(board, tid, pr_url=url, head_sha=sha, actor="operator",
+    seam.bind_pr_target(board, tid, pr_url=url, head_sha=sha, actor="operator", reason="operator readback",
         run=lambda *a: json.dumps(pr))
     monkeypatch.setattr(dispatch, "check_respawn_guard", lambda conn, task_id: None)
     def spawn(conn):
@@ -40,7 +40,7 @@ def test_exact_head_continuation_orders_comment_and_event_with_same_second(board
 def test_mismatched_head_refuses_without_audit(board):
     tid = kb.create_task(board, title="gate", body="Repository: `example/repo`")
     url = "https:" + "//github.com/example/repo/pull/12"
-    seam.bind_pr_target(board, tid, pr_url=url, head_sha="a"*40, actor="operator",
+    seam.bind_pr_target(board, tid, pr_url=url, head_sha="a"*40, actor="operator", reason="operator readback",
         run=lambda *a: json.dumps({"url":url,"state":"OPEN","headRefOid":"a"*40,
             "headRefName":"feature","baseRepository":{"nameWithOwner":"example/repo"}}))
     with pytest.raises(seam.OperatorSeamError, match="head mismatch"):
@@ -70,58 +70,12 @@ def test_operator_wakeup_requires_typed_wait_and_heartbeat(board):
     assert any(e.kind == "unblocked" for e in kb.list_events(board, tid))
 
 
-def test_publish_aborts_on_existing_pr_without_push(board, tmp_path):
-    tid = kb.create_task(board, title="publish", workspace_kind="worktree",
-                         workspace_path=str(tmp_path), branch_name="feature")
-    calls = []
-    def run(*args, **kwargs):
-        calls.append(args)
-        if args[:3] == ("git", "branch", "--show-current"):
-            return "feature"
-        if args[:3] == ("git", "rev-parse", "HEAD"):
-            return "a"*40
-        if args[:2] == ("git", "status"):
-            return ""
-        if args[:3] == ("gh", "pr", "list"):
-            return json.dumps([{"url":"existing"}])
-        pytest.fail("unexpected command")
-    with pytest.raises(seam.OperatorSeamError, match="already exists"):
-        seam.publish_and_continue(board, tid, repo=tmp_path, remote="origin", base="main",
-                                  actor="operator", reason="publish", run=run)
-    assert not any(c[:2] == ("git", "push") for c in calls)
-
-
-def test_publish_verifies_remote_sha_before_creating_pr(board, tmp_path):
-    tid = kb.create_task(board, title="publish", workspace_kind="worktree",
-                         workspace_path=str(tmp_path), branch_name="feature")
-    calls = []
-    def run(*args, **kwargs):
-        calls.append(args)
-        if args[:3] == ("git", "branch", "--show-current"):
-            return "feature"
-        if args[:3] == ("git", "rev-parse", "HEAD"):
-            return "a"*40
-        if args[:2] == ("git", "status"):
-            return ""
-        if args[:3] == ("gh", "pr", "list"):
-            return "[]"
-        if args[:2] == ("git", "push"):
-            return ""
-        if args[:2] == ("git", "ls-remote"):
-            return "b"*40 + " refs/heads/feature"
-        pytest.fail("PR created despite remote head mismatch")
-    with pytest.raises(seam.OperatorSeamError, match="remote head mismatch"):
-        seam.publish_and_continue(board, tid, repo=tmp_path, remote="origin", base="main",
-                                  actor="operator", reason="publish", run=run)
-    assert not any(c[:3] == ("gh", "pr", "create") for c in calls)
-
-
 def test_binding_refuses_pr_from_another_repository(board):
     tid = kb.create_task(board, title="review", body="Repository: `example/repo`", assignee="worker")
     sha = "a" * 40
     url = "https:" + "//github.com/other/repo/pull/12"
     with pytest.raises(seam.OperatorSeamError, match="repository"):
-        seam.bind_pr_target(board, tid, pr_url=url, head_sha=sha, actor="operator",
+        seam.bind_pr_target(board, tid, pr_url=url, head_sha=sha, actor="operator", reason="operator readback",
             run=lambda *args, **kwargs: pytest.fail("unrelated PR should not be fetched"))
     assert not [e for e in kb.list_events(board, tid) if e.kind == "pr_target_bound"]
 
@@ -131,10 +85,85 @@ def test_same_head_on_unbound_pr_cannot_continue(board):
     bound = "https:" + "//github.com/example/repo/pull/12"
     other = "https:" + "//github.com/example/repo/pull/13"
     sha = "a" * 40
-    seam.bind_pr_target(board, task, pr_url=bound, head_sha=sha, actor="operator",
+    seam.bind_pr_target(board, task, pr_url=bound, head_sha=sha, actor="operator", reason="operator readback",
         run=lambda *a: json.dumps({"url":bound,"state":"OPEN","headRefOid":sha,
             "headRefName":"feature","baseRepository":{"nameWithOwner":"example/repo"}}))
     with pytest.raises(seam.OperatorSeamError, match="bound card target"):
         seam.continue_verified_pr(board, task, pr_url=other, head_sha=sha,
             actor="operator", reason="read only", run=lambda *a: pytest.fail("unbound PR fetched"))
     assert not [e for e in kb.list_events(board, task) if e.kind == "pr_continuation"]
+
+
+@pytest.mark.parametrize("action", ["operator-wake", "operator-bind-pr", "operator-continue-pr", "operator-publish-pr"])
+def test_delegated_child_cannot_call_operator_cli(action, monkeypatch):
+    from hermes_cli import kanban
+    from agent import delegation_context
+    monkeypatch.setattr(delegation_context, "kanban_path_is_fenced", lambda path: True)
+    assert kanban._is_delegated_child_cli_mutation(SimpleNamespace(kanban_action=action))
+
+
+def test_operator_bind_cli_persists_its_required_reason(board, monkeypatch):
+    from contextlib import contextmanager
+    from hermes_cli import kanban as cli
+    task = kb.create_task(board, title="review", body="Repository: `example/repo`")
+    url = "https:" + "//github.com/example/repo/pull/12"
+    sha = "a" * 40
+    pr = {"url": url, "state": "OPEN", "headRefOid": sha,
+          "headRefName": "feature", "baseRepository": {"nameWithOwner": "example/repo"}}
+    @contextmanager
+    def connection():
+        yield board
+    monkeypatch.setattr(cli.kbc, "connect_closing", connection)
+    monkeypatch.setattr(cli, "_profile_author", lambda: "operator")
+    original_bind = seam.bind_pr_target
+    monkeypatch.setattr(seam, "bind_pr_target", lambda *a, **kw: original_bind(*a, run=lambda *cmd: json.dumps(pr), **kw))
+    args = SimpleNamespace(kanban_action="operator-bind-pr", task_id=task,
+                           pr_url=url, head_sha=sha, reason=["manual", "review"])
+    assert cli._cmd_operator_seam(args) == 0
+    event = next(e for e in kb.list_events(board, task) if e.kind == "pr_target_bound")
+    assert event.payload["reason"] == "manual review"
+
+
+def test_operator_publication_never_executes_worker_worktree_commands(board, tmp_path):
+    task = kb.create_task(board, title="publish", workspace_kind="worktree",
+                          workspace_path=str(tmp_path), branch_name="feature")
+    with pytest.raises(seam.OperatorSeamError, match="credentialed auto-push is disabled"):
+        seam.publish_and_continue(board, task, repo=tmp_path, remote="origin", base="main",
+                                  actor="operator", reason="scoped",
+                                  run=lambda *a, **kw: pytest.fail("untrusted card Git config executed"))
+
+
+def test_manual_pr_publication_recovery_binds_then_continues(board, monkeypatch, tmp_path):
+    from contextlib import contextmanager
+    from hermes_cli import kanban as cli
+    task = kb.create_task(board, title="review", body="Repository: `example/repo`",
+                          workspace_kind="worktree", workspace_path=str(tmp_path),
+                          branch_name="feature", assignee="worker")
+    url = "https:" + "//github.com/example/repo/pull/12"
+    sha = "a" * 40
+    pr = {"url": url, "state": "OPEN", "headRefOid": sha,
+          "headRefName": "feature", "baseRepository": {"nameWithOwner": "example/repo"}}
+    @contextmanager
+    def connection():
+        yield board
+    monkeypatch.setattr(cli.kbc, "connect_closing", connection)
+    monkeypatch.setattr(cli, "_profile_author", lambda: "operator")
+    original_bind, original_continue = seam.bind_pr_target, seam.continue_verified_pr
+    monkeypatch.setattr(seam, "bind_pr_target", lambda *a, **kw: original_bind(*a, run=lambda *cmd: json.dumps(pr), **kw))
+    def spawn(conn):
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='running',last_heartbeat_at=123 WHERE id=?", (task,))
+            kb._append_event(conn, task, "heartbeat", {"note": "fresh"})
+        return SimpleNamespace(spawned=[(task, "worker", "isolated")])
+    monkeypatch.setattr(dispatch, "check_respawn_guard", lambda conn, task_id: None)
+    monkeypatch.setattr(seam, "continue_verified_pr", lambda *a, **kw: original_continue(
+        *a, run=lambda *cmd: json.dumps(pr), dispatch_fn=spawn, timeout=0, **kw))
+    bind = SimpleNamespace(kanban_action="operator-bind-pr", task_id=task, pr_url=url,
+                           head_sha=sha, reason=["existing", "PR", "readback"])
+    assert cli._cmd_operator_seam(bind) == 0
+    cont = SimpleNamespace(kanban_action="operator-continue-pr", task_id=task, pr_url=url,
+                           head_sha=sha, reason=["recover", "after", "publication"])
+    assert cli._cmd_operator_seam(cont) == 0
+    assert kb.get_task(board, task).status == "running"
+    assert len([e for e in kb.list_events(board, task) if e.kind == "pr_target_bound"]) == 1
+    assert len([e for e in kb.list_events(board, task) if e.kind == "pr_continuation"]) == 1

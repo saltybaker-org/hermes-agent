@@ -8,7 +8,7 @@ For JEV-enabled boards, worktree dispatch now requires board metadata alongside 
 
 Use the actual merged upstream ref and paths for that board. Dispatch checks the linked checkout's registration, branch, upstream ancestry, clean state, and required paths before spawning a worker. Missing metadata or a stale checkout blocks the card for operator repair. The existing `decide-policy` admission and dispatch gates remain mandatory on JEV-enabled boards; no new policy bypass is added.
 
-`kanban block <id> --kind operator_wait <reason>` records a sticky typed wait and emits the existing `blocked` notifier wake event. `kanban operator-wake <id> <reason>` unblocks, dispatches and waits for a new heartbeat. `kanban operator-continue-pr <id> --pr-url <exact-url> --head-sha <40-hex> <reason>` verifies the open PR at its exact head, records the target comment and durable continuation marker, dispatches, and verifies a new heartbeat. `kanban operator-publish-pr <id> --repo <card-worktree> --remote <remote> --base <base> <reason>` additionally checks a clean exact branch, refuses an existing open PR, pushes, reads the remote head, creates the PR, and uses the same continuation path. Failures after push or PR creation retain external state: inspect before retrying; use `operator-continue-pr` rather than creating a duplicate.
+`kanban block <id> --kind operator_wait <reason>` records a sticky typed wait and emits the existing `blocked` notifier wake event. `kanban operator-wake <id> <reason>` unblocks, dispatches and waits for a new heartbeat. **Credentialed `operator-publish-pr` is disabled:** a worker-controlled worktree can contain Git hooks or local configuration that execute in the operator credential context. Publish using a separately trusted operator checkout, read the exact GitHub head back, then run `kanban operator-bind-pr <id> --pr-url <exact-url> --head-sha <40-hex> <reason>` followed by `kanban operator-continue-pr <id> --pr-url <exact-url> --head-sha <40-hex> <reason>`. The latter records the target comment and durable continuation marker, dispatches, and verifies a new heartbeat. If publication succeeds but binding fails, **do not publish again**: inspect the existing PR and retry `operator-bind-pr` on that exact URL/head, then continue. If continuation fails after binding, inspect the card/run before retrying; never rewrite its immutable target.
 
 These commands are operator-only. They never approve, merge, deploy, enter secrets, or complete a human gate. The board needs its normal notifier subscription for wake delivery; an un-subscribed board still records the typed block but cannot deliver a chat ping.
 
@@ -23,8 +23,8 @@ on ready/todo review and human-merge cards. It reads the PR from GitHub and
 records one immutable `pr_target_bound` event matching the card repository,
 base repository, branch (if declared), and head. `operator-continue-pr` and
 `collect-human-merge` refuse an absent, mismatched, or duplicate binding;
-the latter also reads GitHub's actual `merged_by` and exact head. Publication
-binds its newly created PR before continuation. A head move requires a new
+the latter also reads GitHub's actual `merged_by` and exact head. Manual publication
+must be followed by binding before continuation. A head move requires a new
 card and fresh exact-head gates; a binding cannot be rewritten.
 
 Only an operator process with separately held GitHub credentials may execute
@@ -33,3 +33,21 @@ board-database write access**; an environment variable alone is not an
 identity boundary. The collector records a real human merge; it does not
 perform the merge or supply Bob's approval. Do not enable these commands in a
 shared-credential worker runtime.
+
+## Archive authority provisioning (separate host gate)
+
+Archival and human-merge collection deny by default until the operator creates
+`~/.hermes/kanban/archive-authority.json` **outside worker mounts**, owned by
+that host user with an owner-only directory and `0600` file mode. Example policy
+for this lab (substitute only with Bob's explicit approval):
+
+```json
+{"authorized_logins":["myorgcibot"],"human_merge_login":"saltybaker"}
+```
+
+The file path is derived from the OS account, not `HOME`, `HERMES_HOME`, board
+metadata, or caller environment. A malformed, missing, symlinked, writable-by-
+others, or non-owner file denies. The authenticated GitHub caller must match the
+allowlist, while GitHub's actual `merged_by` must match the separate human login.
+Never mount this policy or the operator's GitHub credential into worker containers.
+Install and verify this policy only at the separately authorized host cutover.

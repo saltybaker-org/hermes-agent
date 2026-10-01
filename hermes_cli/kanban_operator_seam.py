@@ -31,13 +31,13 @@ def _card_repository(card):
     raise OperatorSeamError("card has no immutable Repository: owner/repo declaration")
 
 
-def bind_pr_target(conn, task_id, *, pr_url, head_sha, actor, run=command):
+def bind_pr_target(conn, task_id, *, pr_url, head_sha, actor, reason, run=command):
     """Operator readback binds a PR to the card's immutable repository row."""
     if not valid_url(pr_url) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
         raise OperatorSeamError("exact PR URL and head SHA required")
     card = kb.get_task(conn, task_id)
-    if card is None or card.status in {"done", "archived"} or not actor.strip():
-        raise OperatorSeamError("target card must be active and actor named")
+    if card is None or card.status in {"done", "archived"} or not actor.strip() or not reason or not reason.strip():
+        raise OperatorSeamError("target card must be active with named actor and scoped reason")
     expected_repo = _card_repository(card)
     url_repo = "/".join(urlparse(pr_url).path.strip("/").split("/")[:2]).lower()
     if url_repo != expected_repo:
@@ -57,7 +57,7 @@ def bind_pr_target(conn, task_id, *, pr_url, head_sha, actor, run=command):
     if card.branch_name and pr.get("headRefName") != card.branch_name:
         raise OperatorSeamError("PR branch differs from card branch")
     payload = {"pr_url": pr_url, "head_sha": head_sha, "repository": expected_repo,
-               "head_ref": pr.get("headRefName"), "actor": actor.strip()}
+               "head_ref": pr.get("headRefName"), "actor": actor.strip(), "reason": reason.strip()}
     with kb.write_txn(conn):
         kb._append_event(conn, task_id, "pr_target_bound", payload)
     return payload
@@ -120,34 +120,11 @@ def continue_verified_pr(conn, task_id, *, pr_url, head_sha, actor, reason,
 
 def publish_and_continue(conn, task_id, *, repo, remote, base, actor, reason,
                          run=command, **kwargs):
-    """Push exact branch, open PR and perform audited continuation. Never merge."""
-    card = kb.get_task(conn, task_id)
-    if card is None or card.status != "ready" or card.workspace_kind != "worktree":
-        raise OperatorSeamError("publication requires ready worktree card")
-    repo = Path(repo).resolve(strict=True)
-    if repo != Path(card.workspace_path).resolve(strict=True):
-        raise OperatorSeamError("repository differs from card workspace")
-    branch = run("git", "branch", "--show-current", cwd=repo)
-    sha = run("git", "rev-parse", "HEAD", cwd=repo)
-    if branch != card.branch_name or not re.fullmatch(r"[0-9a-f]{40}", sha):
-        raise OperatorSeamError("card branch/head mismatch")
-    if run("git", "status", "--porcelain", cwd=repo):
-        raise OperatorSeamError("dirty publication checkout")
-    try:
-        existing = json.loads(run("gh", "pr", "list", "--head", branch,
-                                  "--state", "open", "--json", "url", cwd=repo))
-    except ValueError as exc:
-        raise OperatorSeamError("existing PR query malformed") from exc
-    if not isinstance(existing, list) or existing:
-        raise OperatorSeamError("open PR already exists; use exact-head continuation")
-    run("git", "push", remote, "HEAD:refs/heads/" + branch, cwd=repo)
-    if run("git", "ls-remote", remote, "refs/heads/" + branch, cwd=repo).split()[0] != sha:
-        raise OperatorSeamError("remote head mismatch")
-    url = run("gh", "pr", "create", "--base", base, "--head", branch,
-              "--title", card.title, "--body", card.body or "", cwd=repo).splitlines()[-1]
-    bind_pr_target(conn, task_id, pr_url=url, head_sha=sha, actor=actor, run=run)
-    return continue_verified_pr(conn, task_id, pr_url=url, head_sha=sha,
-                                actor=actor, reason=reason, run=run, **kwargs)
+    """Fail closed: card worktrees may define credential-stealing Git hooks/config."""
+    raise OperatorSeamError(
+        "credentialed auto-push is disabled; publish from a trusted operator checkout, "
+        "then use operator-bind-pr and operator-continue-pr with exact head readback"
+    )
 
 
 def wake_operator_wait(conn, task_id, *, reason, dispatch_fn=None, timeout=30):

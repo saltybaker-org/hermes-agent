@@ -36,12 +36,17 @@ def resolve_triage(conn, task_id: str, *, verdict: str, reason: str, actor: str)
         if row["completion_contract"] not in (None, "local-only"):
             raise TriageResolutionDenied("PR contract requires the normal acceptance collector")
         from hermes_cli.kanban_closure_mutation import _stage
-        stage = (_stage(conn, task_id) or {}).get("payload", {}).get("stage")
+        stage_event = _stage(conn, task_id)
+        stage = stage_event["payload"].get("stage") if stage_event is not None else None
         if isinstance(stage, str) and "merge" in stage:
             raise TriageResolutionDenied("merge stage requires its human/closure authorization boundary")
         if isinstance(stage, str) and ("review" in stage or "qa" in stage):
             if gate is None or _gate_payload(gate[1], task_id)["verdict"] not in {"APPROVE", "PASS"}:
                 raise TriageResolutionDenied("review/QA stage requires a structured approving gate verdict")
+        elif stage_event is not None:
+            # A new pipeline stage is not implicitly a local-only task: its
+            # normal completion gate may encode authority we cannot infer.
+            raise TriageResolutionDenied("unrecognized pipeline stage requires its normal completion gate")
         if not kb._parents_satisfied(conn, task_id):
             raise TriageResolutionDenied("task has unsatisfied parents")
         now = int(time.time())

@@ -213,6 +213,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review", "continue-pr", "resolve-triage",
     "gc", "verified-archive", "archive-manifest", "collect-human-merge", "publish-closure",
+    "operator-wake", "operator-bind-pr", "operator-continue-pr", "operator-publish-pr",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
@@ -1117,7 +1118,7 @@ def _cmd_operator_seam(args: argparse.Namespace) -> int:
                 receipt = seam.wake_operator_wait(conn, args.task_id, reason=reason)
             elif args.kanban_action == "operator-bind-pr":
                 receipt = seam.bind_pr_target(conn, args.task_id,
-                    pr_url=args.pr_url, head_sha=args.head_sha, actor=_profile_author())
+                    pr_url=args.pr_url, head_sha=args.head_sha, actor=_profile_author(), reason=reason)
             elif args.kanban_action == "operator-continue-pr":
                 receipt = seam.continue_verified_pr(conn, args.task_id,
                     pr_url=args.pr_url, head_sha=args.head_sha, actor=_profile_author(), reason=reason)

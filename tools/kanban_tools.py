@@ -423,7 +423,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 
 # --- Goal-mode judge gate ---
 
-_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input", "operator_wait"})
 
 
 def _goal_judge_available() -> bool:

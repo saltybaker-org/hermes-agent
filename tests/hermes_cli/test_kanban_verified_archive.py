@@ -8,8 +8,10 @@ from hermes_cli import kanban_verified_archive as kva
 
 @pytest.fixture
 def board(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_KANBAN_ARCHIVE_AUTHORIZED_LOGINS", "bob")
-    monkeypatch.setenv("HERMES_KANBAN_HUMAN_MERGE_LOGIN", "bob")
+    policy = tmp_path / "archive-authority.json"
+    policy.write_text(json.dumps({"authorized_logins": ["bob"], "human_merge_login": "bob"}), encoding="utf-8")
+    policy.chmod(0o600)
+    monkeypatch.setattr(kva, "_policy_path", lambda: policy)
     def gh(endpoint):
         if endpoint == "user": return {"login": "bob"}
         return {"html_url": "https:" + "//github.com/example/repo/pull/1", "merged": True,
@@ -286,6 +288,7 @@ def test_manifest_builder_enumerates_all_ancestors_and_receipt(board):
 def test_archive_requires_authenticated_authorized_caller(board, monkeypatch):
     rejected, _, _, manifest = _fixture(board)
     monkeypatch.setenv("HERMES_KANBAN_ARCHIVE_AUTHORIZED_LOGINS", "another-operator")
+    monkeypatch.setattr(kva, "_gh_json", lambda endpoint: {"login": "another-operator"})
     with pytest.raises(kva.VerifiedArchiveDenied, match="authorized archiver"):
         kva.verified_archive_superseded_gate(board, manifest)
     assert kb.get_task(board, rejected).status == "blocked"
@@ -373,3 +376,30 @@ def test_human_merge_evidence_requires_this_cards_pr_binding(board):
         kva.record_merge_evidence(board, task, candidate_sha="a"*40,
             pr_url="https:" + "//github.com/example/repo/pull/1")
     assert kva._event_payload(board, task, "human_merge_verified") is None
+
+
+def test_environment_cannot_self_authorize_archive(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_ARCHIVE_AUTHORIZED_LOGINS", "attacker")
+    monkeypatch.setenv("HERMES_KANBAN_HUMAN_MERGE_LOGIN", "attacker")
+    monkeypatch.setattr(kva, "_gh_json", lambda endpoint: {"login": "attacker"})
+    monkeypatch.setattr(kva, "_policy_path", lambda: Path("/nonexistent/archive-authority.json"))
+    with pytest.raises(kva.VerifiedArchiveDenied, match="archive authority policy"):
+        kva._authorized_login()
+
+
+@pytest.mark.parametrize("unsafe", ["world_writable", "symlink", "duplicate_key"])
+def test_archive_authority_policy_file_must_be_private(tmp_path, monkeypatch, unsafe):
+    policy = tmp_path / "archive-authority.json"
+    content = '{"authorized_logins":["bob"],"human_merge_login":"bob"}'
+    if unsafe == "duplicate_key":
+        content = '{"authorized_logins":["bob"],"authorized_logins":["attacker"],"human_merge_login":"bob"}'
+    target = tmp_path / "target.json" if unsafe == "symlink" else policy
+    target.write_text(content, encoding="utf-8")
+    target.chmod(0o600)
+    if unsafe == "symlink":
+        policy.symlink_to(target)
+    elif unsafe == "world_writable":
+        policy.chmod(0o666)
+    monkeypatch.setattr(kva, "_policy_path", lambda: policy)
+    with pytest.raises(kva.VerifiedArchiveDenied, match="archive authority policy"):
+        kva._authorized_login()

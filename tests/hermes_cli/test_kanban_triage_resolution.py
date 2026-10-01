@@ -92,3 +92,21 @@ def test_resolve_cli_json_and_worker_denial(board, monkeypatch, capsys):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "some-worker-card")
     assert cli._cmd_resolve_triage(args) == 2
     assert kb.get_task(board, other).status == "triage"
+
+
+def test_unknown_pipeline_stage_cannot_satisfy_dependencies(board):
+    task = triage(board)
+    with kb.write_txn(board):
+        kb._append_event(board, task, "pipeline_stage", {"stage": "release_activation", "feature_id": "F-003"})
+    with pytest.raises(tr.TriageResolutionDenied, match="unrecognized pipeline stage"):
+        tr.resolve_triage(board, task, verdict="PASS", reason="not a stage gate", actor="operator")
+    assert kb.get_task(board, task).status == "triage"
+
+
+def test_missing_pipeline_stage_name_cannot_escape_triage(board):
+    task = triage(board)
+    with kb.write_txn(board):
+        kb._append_event(board, task, "pipeline_stage", {"feature_id": "F-003"})
+    with pytest.raises(tr.TriageResolutionDenied, match="unrecognized pipeline stage"):
+        tr.resolve_triage(board, task, verdict="PASS", reason="bad stage", actor="operator")
+    assert kb.get_task(board, task).status == "triage"
