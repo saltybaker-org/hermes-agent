@@ -27,6 +27,8 @@ the latter also reads GitHub's actual `merged_by` and exact head. Manual publica
 must be followed by binding before continuation. A head move requires a new
 card and fresh exact-head gates; a binding cannot be rewritten.
 
+GitHub authority readbacks use the root-owned, non-writable `/usr/bin/gh` on
+Linux, not the caller's `PATH`; if that binary is absent they deny.
 Only an operator process with separately held GitHub credentials may execute
 these commands. Worker containers must have **no host CLI/gh credential or
 board-database write access**; an environment variable alone is not an

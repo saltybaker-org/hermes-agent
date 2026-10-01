@@ -11,6 +11,7 @@ from typing import Any
 from pathlib import Path
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_trusted_gh import trusted_gh
 
 SCHEMA_VERSION = "kanban-verified-archive.v2"
 LEGACY_SCHEMA_VERSION = "kanban-verified-archive.v1"
@@ -87,7 +88,7 @@ def _digest(value: dict) -> str:
 
 def _gh_json(endpoint: str) -> dict:
     try:
-        proc = subprocess.run(["gh", "api", endpoint, "--hostname", "github.com"],
+        proc = subprocess.run([trusted_gh(), "api", endpoint, "--hostname", "github.com"],
                               capture_output=True, text=True, timeout=30, check=True,
                               stdin=subprocess.DEVNULL)
         value = json.loads(proc.stdout)

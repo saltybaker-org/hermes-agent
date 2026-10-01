@@ -8,12 +8,15 @@ from pathlib import Path
 from urllib.parse import urlparse
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as dispatch
+from hermes_cli.kanban_trusted_gh import trusted_gh
 
 class OperatorSeamError(RuntimeError):
     pass
 
 def command(*argv, cwd=None):
-    result = subprocess.run(argv, cwd=cwd, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=60)
+    if not argv or argv[0] != "gh":
+        raise OperatorSeamError("operator readback only accepts the trusted GitHub CLI")
+    result = subprocess.run((trusted_gh(), *argv[1:]), cwd=cwd, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=60)
     if result.returncode:
         raise OperatorSeamError("operator command failed: " + argv[0])
     return result.stdout.strip()
@@ -59,6 +62,13 @@ def bind_pr_target(conn, task_id, *, pr_url, head_sha, actor, reason, run=comman
     payload = {"pr_url": pr_url, "head_sha": head_sha, "repository": expected_repo,
                "head_ref": pr.get("headRefName"), "actor": actor.strip(), "reason": reason.strip()}
     with kb.write_txn(conn):
+        # Network readback can race another operator. Check immutability again
+        # under the write lock before committing exactly one binding.
+        if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='pr_target_bound'", (task_id,)).fetchone():
+            raise OperatorSeamError("PR target is immutable; create a replacement card")
+        current = kb.get_task(conn, task_id)
+        if current is None or current.status in {"done", "archived"}:
+            raise OperatorSeamError("target card changed before binding")
         kb._append_event(conn, task_id, "pr_target_bound", payload)
     return payload
 

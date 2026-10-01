@@ -1,4 +1,5 @@
 from __future__ import annotations
+import sys
 import json
 from pathlib import Path
 import pytest
@@ -403,3 +404,15 @@ def test_archive_authority_policy_file_must_be_private(tmp_path, monkeypatch, un
     monkeypatch.setattr(kva, "_policy_path", lambda: policy)
     with pytest.raises(kva.VerifiedArchiveDenied, match="archive authority policy"):
         kva._authorized_login()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux operator binary trust anchor")
+def test_merge_evidence_uses_trusted_github_binary(monkeypatch):
+    from types import SimpleNamespace
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(stdout='{"login":"bob"}')
+    monkeypatch.setattr(kva.subprocess, "run", run)
+    assert kva._gh_json("user") == {"login": "bob"}
+    assert calls[0][0] == "/usr/bin/gh"

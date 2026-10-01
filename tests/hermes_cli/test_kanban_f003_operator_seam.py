@@ -1,3 +1,4 @@
+import sys
 import json
 from types import SimpleNamespace
 import pytest
@@ -167,3 +168,30 @@ def test_manual_pr_publication_recovery_binds_then_continues(board, monkeypatch,
     assert kb.get_task(board, task).status == "running"
     assert len([e for e in kb.list_events(board, task) if e.kind == "pr_target_bound"]) == 1
     assert len([e for e in kb.list_events(board, task) if e.kind == "pr_continuation"]) == 1
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux operator binary trust anchor")
+def test_github_readback_does_not_execute_path_substitute(tmp_path, monkeypatch):
+    fake = tmp_path / "gh"
+    fake.write_text("#!/bin/sh\nprintf 'FAKE GH\n'\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert seam.command("gh", "--version").startswith("gh version")
+
+
+def test_concurrent_binding_cannot_create_two_immutable_targets(board):
+    task = kb.create_task(board, title="review", body="Repository: `example/repo`")
+    url = "https:" + "//github.com/example/repo/pull/12"
+    sha = "a" * 40
+    pr = {"url": url, "state": "OPEN", "headRefOid": sha,
+          "headRefName": "feature", "baseRepository": {"nameWithOwner": "example/repo"}}
+    def competing_readback(*args):
+        with kb.write_txn(board):
+            kb._append_event(board, task, "pr_target_bound", {"pr_url": url,
+                "head_sha": sha, "repository": "example/repo", "head_ref": "feature",
+                "actor": "other", "reason": "first bind"})
+        return json.dumps(pr)
+    with pytest.raises(seam.OperatorSeamError, match="immutable"):
+        seam.bind_pr_target(board, task, pr_url=url, head_sha=sha,
+                            actor="operator", reason="second bind", run=competing_readback)
+    assert len([e for e in kb.list_events(board, task) if e.kind == "pr_target_bound"]) == 1
