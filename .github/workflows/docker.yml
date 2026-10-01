@@ -15,6 +15,7 @@ on:
   # path publishes only immutable version tags; the ordered stable publication
   # controller moves stable/latest from the receipt-bound registry digest.
   pull_request:
+    branches-ignore: [lab/main]
   push:
     branches: [main]
   workflow_call:

@@ -12,6 +12,7 @@ name: Nix flake check
 
 on:
   pull_request:
+    branches-ignore: [lab/main]
   push:
     branches: [main]
   workflow_call:

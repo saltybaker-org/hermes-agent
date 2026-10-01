@@ -30,6 +30,7 @@ on:
         type: boolean
         default: false
   pull_request:
+    branches-ignore: [lab/main]
   push:
     branches: [main]
 
