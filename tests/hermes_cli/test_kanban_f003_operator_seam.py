@@ -195,3 +195,35 @@ def test_concurrent_binding_cannot_create_two_immutable_targets(board):
         seam.bind_pr_target(board, task, pr_url=url, head_sha=sha,
                             actor="operator", reason="second bind", run=competing_readback)
     assert len([e for e in kb.list_events(board, task) if e.kind == "pr_target_bound"]) == 1
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux operator environment isolation")
+def test_operator_github_command_scrubs_untrusted_environment(monkeypatch):
+    from types import SimpleNamespace as NS
+    monkeypatch.setenv("LD_PRELOAD", "/untrusted/agent-hook.so")
+    monkeypatch.setenv("GH_TOKEN", "untrusted-token")
+    seen = []
+    def run(argv, **kwargs):
+        seen.append(kwargs)
+        return NS(returncode=0, stdout='{"state":"OPEN"}')
+    monkeypatch.setattr(seam.subprocess, "run", run)
+    assert seam.command("gh", "pr", "view", "https://github.com/example/repo/pull/12")
+    assert "LD_PRELOAD" not in seen[0]["env"]
+    assert "GH_TOKEN" not in seen[0]["env"]
+    assert seen[0]["cwd"] == seen[0]["env"]["HOME"]
+
+
+def test_card_repository_change_during_github_readback_refuses_binding(board):
+    task = kb.create_task(board, title="review", body="Repository: `example/repo`")
+    url = "https:" + "//github.com/example/repo/pull/12"
+    sha = "a" * 40
+    pr = {"url": url, "state": "OPEN", "headRefOid": sha,
+          "headRefName": "feature", "baseRepository": {"nameWithOwner": "example/repo"}}
+    def concurrent_edit(*args):
+        with kb.write_txn(board):
+            board.execute("UPDATE tasks SET body=? WHERE id=?", ("Repository: `other/repo`", task))
+        return json.dumps(pr)
+    with pytest.raises(seam.OperatorSeamError, match="card repository changed"):
+        seam.bind_pr_target(board, task, pr_url=url, head_sha=sha,
+                            actor="operator", reason="readback", run=concurrent_edit)
+    assert not [e for e in kb.list_events(board, task) if e.kind == "pr_target_bound"]

@@ -28,7 +28,11 @@ must be followed by binding before continuation. A head move requires a new
 card and fresh exact-head gates; a binding cannot be rewritten.
 
 GitHub authority readbacks use the root-owned, non-writable `/usr/bin/gh` on
-Linux, not the caller's `PATH`; if that binary is absent they deny.
+Linux, not the caller's `PATH`; if that binary is absent they deny. They run
+from the OS account's home with a minimal environment (no inherited loader
+hooks or caller-supplied `GH_TOKEN`); this host's stored GitHub login was
+verified to work through that path. Operator credentials must be provisioned
+in the account's protected GitHub config, not passed through worker env.
 Only an operator process with separately held GitHub credentials may execute
 these commands. Worker containers must have **no host CLI/gh credential or
 board-database write access**; an environment variable alone is not an

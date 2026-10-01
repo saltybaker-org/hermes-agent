@@ -416,3 +416,19 @@ def test_merge_evidence_uses_trusted_github_binary(monkeypatch):
     monkeypatch.setattr(kva.subprocess, "run", run)
     assert kva._gh_json("user") == {"login": "bob"}
     assert calls[0][0] == "/usr/bin/gh"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux operator environment isolation")
+def test_merge_readback_scrubs_caller_environment(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setenv("LD_PRELOAD", "/untrusted/agent-hook.so")
+    monkeypatch.setenv("GH_TOKEN", "untrusted-token")
+    seen = []
+    def run(argv, **kwargs):
+        seen.append(kwargs)
+        return SimpleNamespace(stdout='{"login":"bob"}')
+    monkeypatch.setattr(kva.subprocess, "run", run)
+    assert kva._gh_json("user") == {"login": "bob"}
+    assert "LD_PRELOAD" not in seen[0]["env"]
+    assert "GH_TOKEN" not in seen[0]["env"]
+    assert seen[0]["cwd"] == seen[0]["env"]["HOME"]

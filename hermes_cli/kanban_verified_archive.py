@@ -11,7 +11,7 @@ from typing import Any
 from pathlib import Path
 
 from hermes_cli import kanban_db as kb
-from hermes_cli.kanban_trusted_gh import trusted_gh
+from hermes_cli.kanban_trusted_gh import trusted_gh, trusted_gh_env
 
 SCHEMA_VERSION = "kanban-verified-archive.v2"
 LEGACY_SCHEMA_VERSION = "kanban-verified-archive.v1"
@@ -88,9 +88,11 @@ def _digest(value: dict) -> str:
 
 def _gh_json(endpoint: str) -> dict:
     try:
+        safe_env = trusted_gh_env()
         proc = subprocess.run([trusted_gh(), "api", endpoint, "--hostname", "github.com"],
-                              capture_output=True, text=True, timeout=30, check=True,
-                              stdin=subprocess.DEVNULL)
+                              cwd=safe_env["HOME"], env=safe_env,
+                              capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=30, check=True, stdin=subprocess.DEVNULL)
         value = json.loads(proc.stdout)
         if not isinstance(value, dict): raise ValueError("response is not an object")
         return value

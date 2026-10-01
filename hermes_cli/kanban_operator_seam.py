@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as dispatch
-from hermes_cli.kanban_trusted_gh import trusted_gh
+from hermes_cli.kanban_trusted_gh import trusted_gh, trusted_gh_env
 
 class OperatorSeamError(RuntimeError):
     pass
@@ -16,7 +16,12 @@ class OperatorSeamError(RuntimeError):
 def command(*argv, cwd=None):
     if not argv or argv[0] != "gh":
         raise OperatorSeamError("operator readback only accepts the trusted GitHub CLI")
-    result = subprocess.run((trusted_gh(), *argv[1:]), cwd=cwd, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=60)
+    if cwd is not None:
+        raise OperatorSeamError("GitHub readback cannot execute from an untrusted worktree")
+    safe_env = trusted_gh_env()
+    result = subprocess.run((trusted_gh(), *argv[1:]), cwd=safe_env["HOME"], env=safe_env,
+                            stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                            capture_output=True, timeout=60)
     if result.returncode:
         raise OperatorSeamError("operator command failed: " + argv[0])
     return result.stdout.strip()
@@ -69,6 +74,8 @@ def bind_pr_target(conn, task_id, *, pr_url, head_sha, actor, reason, run=comman
         current = kb.get_task(conn, task_id)
         if current is None or current.status in {"done", "archived"}:
             raise OperatorSeamError("target card changed before binding")
+        if _card_repository(current) != expected_repo or current.branch_name != card.branch_name:
+            raise OperatorSeamError("card repository changed before binding")
         kb._append_event(conn, task_id, "pr_target_bound", payload)
     return payload
 
