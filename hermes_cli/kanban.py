@@ -192,7 +192,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             return _err(f"kanban: unknown action {action!r}", 2)
         try:
             return int(handler(args) or 0)
-        except (ValueError, RuntimeError, PermissionError) as exc:
+        except PermissionError as exc:
+            return _err(f"kanban: {exc}", 2)
+        except (ValueError, RuntimeError) as exc:
             return _err(f"kanban: {exc}")
 
 
@@ -209,7 +211,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "request-review", "request-changes", "reopen-review",
+    "request-review", "request-changes", "reopen-review", "continue-pr",
     "gc",
 })
 
@@ -373,6 +375,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
+            worker_max_turns=getattr(args, "worker_max_turns", 500),
+            budget_exception_receipt=(json.loads(Path(args.budget_exception_receipt).read_text(encoding="utf-8-sig")) if getattr(args,"budget_exception_receipt",None) else None),
             initial_status=getattr(args, "initial_status", "running"),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
@@ -388,6 +392,45 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _cmd_construct_pipeline(args: argparse.Namespace) -> int:
+    from pathlib import Path
+    from hermes_cli import kanban_pipeline_mutation as pipeline
+    from hermes_cli.kanban_jev_gate import JevAuthorizationError
+    try:
+        manifest=pipeline.load_json_object(Path(args.manifest))
+        cards=pipeline.load_json_object(Path(args.cards))
+        with kbc.connect_closing() as conn:
+            created=pipeline.create_pipeline(conn,manifest,cards)
+    except (pipeline.PipelineConstructionError,JevAuthorizationError) as exc:
+        return _err(f"pipeline construction denied: {exc}",2)
+    if getattr(args,"json",False): _print_json(created)
+    else:
+        for key,task_id in created.items(): print(f"{key}: {task_id}")
+    return 0
+
+
+def _cmd_publish_closure(args: argparse.Namespace) -> int:
+    from pathlib import Path
+    from hermes_cli import kanban_pipeline_mutation as pipeline
+    from hermes_cli.kanban_closure_mutation import publish_closure
+    from hermes_cli.kanban_jev_gate import JevAuthorizationError
+    try:
+        evidence=pipeline.load_json_object(Path(args.evidence))
+        with kbc.connect_closing() as conn:
+            ok=publish_closure(
+                conn,args.task_id,evidence=evidence,document=Path(args.document),
+                result=args.result,summary=args.summary,
+                expected_run_id=_worker_run_id_for(args.task_id),
+            )
+    except (pipeline.PipelineConstructionError,JevAuthorizationError) as exc:
+        return _err(f"closure publication denied: {exc}",2)
+    if not ok: return _err("closure publication denied by task lifecycle",2)
+    receipt={"task_id":args.task_id,"published":True}
+    if getattr(args,"json",False): _print_json(receipt)
+    else: print(f"Published closure {args.task_id}")
     return 0
 
 
@@ -1026,9 +1069,24 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+        op = lambda tid: kb.unblock_task(conn, tid, reason=reason, author=author)
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+
+
+def _cmd_continue_pr(args: argparse.Namespace) -> int:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban continue-pr is orchestrator-only")
+    reason = _joined_words(args.reason)
+    with kbc.connect_closing() as conn:
+        ok = kb.record_pr_continuation(
+            conn, args.task_id, actor=_profile_author(), reason=reason,
+        )
+    return _ok_or_err(
+        ok,
+        f"cannot continue PR for {args.task_id} (task must be ready)",
+        f"Authorized existing-PR continuation for {args.task_id}: {reason}",
+    )
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
@@ -1133,6 +1191,22 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
 
 
+def _cmd_verified_archive(args: argparse.Namespace) -> int:
+    from pathlib import Path
+    from hermes_cli import kanban_verified_archive as kva
+    try:
+        manifest = kva.load_manifest(Path(args.manifest))
+        with kbc.connect_closing() as conn:
+            receipt = kva.verified_archive_superseded_gate(conn, manifest)
+    except kva.VerifiedArchiveDenied as exc:
+        return _err(f"verified archive denied: {exc}", 2)
+    if getattr(args, "json", False):
+        _print_json(receipt)
+    else:
+        print(f"Verified archive {receipt['archived_task_id']} superseded by {receipt['replacement_task_id']}")
+    return 0
+
+
 def _cmd_stats(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         stats = kb.board_stats(conn)
@@ -1148,6 +1222,24 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    return 0
+
+
+def _cmd_metrics(args: argparse.Namespace) -> int:
+    try:
+        with kbc.connect_closing() as conn:
+            report = kb.cohort_metrics(conn, args.task_ids, as_of=args.as_of)
+    except ValueError as exc:
+        return _err(str(exc))
+    if _json_out(args, report):
+        return 0
+    print(f"Cohort: {report['task_counts']['requested']} tasks, "
+          f"{sum(report['run_outcomes'].values())} closed runs")
+    wall = report["durations"]["cohort_wall_seconds"]
+    print(f"Wall time: {wall if wall is not None else 'incomplete'}")
+    print("Outcomes: " + ", ".join(
+        f"{name}={count}" for name, count in report["run_outcomes"].items()
+    ))
     return 0
 
 
@@ -1317,7 +1409,9 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 
 _HANDLERS = {
-    "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
+    "init": _cmd_init, "create": _cmd_create,
+    "construct-pipeline": _cmd_construct_pipeline, "publish-closure": _cmd_publish_closure,
+    "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
@@ -1326,11 +1420,13 @@ _HANDLERS = {
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
-    "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "schedule": _cmd_schedule, "unblock": _cmd_unblock, "continue-pr": _cmd_continue_pr,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
-    "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
+    "archive": _cmd_archive, "verified-archive": _cmd_verified_archive,
+    "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
+    "metrics": _cmd_metrics,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
@@ -1348,12 +1444,14 @@ Common subcommands:
   `list` (alias `ls`)   List tasks on the current board
   `show <id>`           Task details + comments + events
   `stats`               Per-status / per-assignee counts
+  `metrics <ids...>`    Cohort latency and failure metrics
   `create <title>…`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
+`continue-pr <id> <reason>` Explicitly resume a ready task on its existing PR
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts
@@ -1433,11 +1531,3 @@ def run_slash(rest: str) -> str:
     if err and out:
         return f"{out}\n{err}"
     return err if err else (out or "(no output)")
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-from typing import Any  # noqa: F401,E402
-# ---- END PLUGIN-COMPAT ----

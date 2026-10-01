@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import hashlib
 import os
 import re
 import secrets
@@ -738,6 +739,14 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    worker_max_turns: int = 500
+    budget_exception_reason: Optional[str] = None
+    budget_exception_receipt: Optional[str] = None
+    budget_exception_actor: Optional[str] = None
+    budget_exception_at: Optional[int] = None
+    budget_exception_measured_bytes: Optional[int] = None
+    budget_exception_limit_bytes: Optional[int] = None
+    budget_policy_version: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -768,6 +777,9 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    "worker_max_turns", "budget_exception_reason", "budget_exception_receipt", "budget_exception_actor",
+    "budget_exception_at", "budget_exception_measured_bytes",
+    "budget_exception_limit_bytes", "budget_policy_version",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -972,7 +984,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    worker_max_turns INTEGER NOT NULL DEFAULT 500,
+    budget_exception_reason TEXT,
+    budget_exception_actor TEXT,
+    budget_exception_at INTEGER,
+    budget_exception_measured_bytes INTEGER,
+    budget_exception_limit_bytes INTEGER,
+    budget_policy_version TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1047,6 +1066,23 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     uploaded_by  TEXT,
     created_at   INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS task_closure_publications (
+    task_id TEXT PRIMARY KEY,
+    evidence_json TEXT NOT NULL,
+    document_bytes BLOB NOT NULL,
+    evidence_sha256 TEXT NOT NULL,
+    document_sha256 TEXT NOT NULL,
+    authorization_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS jev_pipeline_publications (
+    feature_id TEXT PRIMARY KEY,
+    manifest_sha256 TEXT NOT NULL,
+    mapping_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
 
 -- Subscription from a gateway source (platform + chat + thread) to a
 -- task. The gateway's kanban-notifier watcher tails task_events and
@@ -1266,6 +1302,13 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    worker_max_turns: int = 500,
+    budget_exception_reason: Optional[str] = None,
+    budget_exception_receipt: Optional[dict] = None,
+    _pipeline_capability: Any = None,
+    _task_id: Optional[str] = None, _created_at: Optional[int] = None,
+    _preview_only: bool = False, _planned_status: Optional[str] = None,
+    _planned_tenant: Optional[str] = None, _preauthorized_payload: Optional[dict] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1291,6 +1334,26 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    # A successful idempotent admission is durable; retries return it before
+    # revalidating an external receipt that may have expired meanwhile.
+    if idempotency_key:
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
+        ).fetchone()
+        if row:
+            return row["id"]
+    from hermes_cli.kanban_limits import evaluate_card_budget
+    if budget_exception_reason:
+        raise PermissionError("self-asserted exceptions are forbidden; provide a signed receipt")
+    now = int(time.time())
+    budget = evaluate_card_budget(
+        title.strip(), body, worker_max_turns=worker_max_turns,
+        exception_receipt=budget_exception_receipt, idempotency_key=idempotency_key,
+        admission_time=now,
+    )
+    budget_exception_actor = str((budget_exception_receipt or {}).get("actor", "")).strip() or None
+    budget_exception_reason = str((budget_exception_receipt or {}).get("reason", "")).strip() or None
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
     # A project-scoped board anchors every new task to its project's repo
@@ -1331,7 +1394,12 @@ def create_task(
         if row:
             return row["id"]
 
-    now = int(time.time())
+    now = int(time.time()) if _created_at is None else int(_created_at)
+    priority=int(priority)
+    max_runtime_seconds=_opt_int(max_runtime_seconds)
+    max_retries=_opt_int(max_retries)
+    goal_max_turns=_opt_int(goal_max_turns)
+    goal_mode=bool(goal_mode)
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
     # task inheriting it would point cleanup at the user's source tree.
@@ -1341,20 +1409,47 @@ def create_task(
             workspace_path = str(board_default)
 
     # Retry once on the extremely unlikely id collision.
-    for attempt in range(2):
-        task_id = _new_task_id()
+    requested_tenant=tenant
+    requested_session_id=session_id
+    def effective_session_id():
+        if requested_session_id is not None or not creator_task_id: return requested_session_id
+        row=conn.execute("SELECT session_id FROM tasks WHERE id=?",(creator_task_id,)).fetchone()
+        return row["session_id"] if row else None
+    for attempt in range(1 if _task_id is not None else 2):
+        task_id=_task_id or _new_task_id()
+        from hermes_cli.kanban_jev_gate import JevAuthorizationError,authorize_card,card_payload
+        if _planned_status is not None:
+            task_status,resolved_tenant=_planned_status,_planned_tenant
+        else:
+            task_status,resolved_tenant=initial_task_state(conn,parents,initial_status,triage,requested_tenant)
+        proposed_workspace_path=workspace_path
+        proposed_branch_name=branch_name
+        if project_obj is not None and workspace_kind=="worktree":
+            if project_repo and not proposed_workspace_path: proposed_workspace_path=os.path.join(project_repo,".worktrees",task_id)
+            if not proposed_branch_name: proposed_branch_name=_project_branch_name(project_obj,task_id,title)
+        def mutation_payload(status_value,tenant_value,session_value):
+            return card_payload(task_id,title=title.strip(),body=body,assignee=assignee,status=status_value,created_by=created_by,created_at=now,workspace_kind=workspace_kind,workspace_path=proposed_workspace_path,branch_name=proposed_branch_name,project_id=project_id,tenant=tenant_value,priority=priority,parents=list(parents),triage=triage,idempotency_key=idempotency_key,max_runtime_seconds=max_runtime_seconds,skills=skills_list,max_retries=max_retries,model_override=model_override,provider_override=provider_override,reasoning_effort=reasoning_effort,goal_mode=goal_mode,goal_max_turns=goal_max_turns,session_id=session_value,creator_task_id=creator_task_id,project_source_task_id=project_source_task_id,completion_contract=completion_contract)
+        authorized_session_id=effective_session_id()
+        authorized_payload=mutation_payload(task_status,resolved_tenant,authorized_session_id)
+        if _preview_only:
+            return authorized_payload
+        if _pipeline_capability is None:
+            authorize_card(conn,authorized_payload)
+        else:
+            from hermes_cli.kanban_pipeline_mutation import require_pipeline_capability
+            require_pipeline_capability(_pipeline_capability)
+            if not isinstance(_preauthorized_payload,dict) or _preauthorized_payload.get("mutation_sha256")!=authorized_payload["mutation_sha256"]:
+                raise JevAuthorizationError("pipeline card authorization does not match durable payload")
         try:
-            # allow_nested: graph builders compose create_task under one outer
-            # commit so the dispatcher never sees a half-built graph.
-            with write_txn(conn, allow_nested=True):
-                task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
-                # Project worktree: fresh dir under the repo + deterministic
-                # branch, instead of the random ``wt/<id>`` worker fallback.
-                if project_obj is not None and workspace_kind == "worktree":
-                    if project_repo and not workspace_path:
-                        workspace_path = os.path.join(project_repo, ".worktrees", task_id)
-                    if not branch_name:
-                        branch_name = _project_branch_name(project_obj, task_id, title)
+            with write_txn(conn,allow_nested=True):
+                current_status,current_tenant=initial_task_state(conn,parents,initial_status,triage,requested_tenant)
+                current_session_id=effective_session_id()
+                current_payload=mutation_payload(current_status,current_tenant,current_session_id)
+                if current_payload["mutation_sha256"]!=authorized_payload["mutation_sha256"]:
+                    raise JevAuthorizationError("card state changed after authorization")
+                task_status,tenant=current_status,current_tenant
+                session_id=current_session_id
+                workspace_path,branch_name=proposed_workspace_path,proposed_branch_name
 
                 conn.execute(
                     """
@@ -1372,10 +1467,28 @@ def create_task(
                         task_id, title.strip(), body, assignee, task_status, priority,
                         created_by, now, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
-                        _opt_int(max_runtime_seconds),
+                        max_runtime_seconds,
                         json.dumps(skills_list) if skills_list is not None else None,
-                        _opt_int(max_retries), model_override, provider_override, reasoning_effort,
-                        1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        max_retries, model_override, provider_override, reasoning_effort,
+                        1 if goal_mode else 0, goal_max_turns, session_id, completion_contract,
+                    ),
+                )
+                exception_at = now if budget.exception_authorized else None
+                conn.execute(
+                    "UPDATE tasks SET worker_max_turns = ?, budget_exception_reason = ?, budget_exception_receipt = ?, "
+                    "budget_exception_actor = ?, budget_exception_at = ?, "
+                    "budget_exception_measured_bytes = ?, budget_exception_limit_bytes = ?, "
+                    "budget_policy_version = ? WHERE id = ?",
+                    (
+                        budget.worker_max_turns,
+                        budget_exception_reason if budget.exception_authorized else None,
+                        json.dumps(budget_exception_receipt,sort_keys=True,separators=(",",":")) if budget.exception_authorized else None,
+                        budget_exception_actor if budget.exception_authorized else None,
+                        exception_at,
+                        budget.measured_bytes if budget.exception_authorized else None,
+                        budget.limit_bytes if budget.exception_authorized else None,
+                        budget.policy_version if budget.exception_authorized else None,
+                        task_id,
                     ),
                 )
                 for pid in parents:
@@ -1394,12 +1507,25 @@ def create_task(
                         "workspace_path": workspace_path,
                         "branch_name": branch_name,
                         "project_id": project_id,
+                        "worker_max_turns": budget.worker_max_turns,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
                     },
                 )
+                if budget.exception_authorized:
+                    _append_event(
+                        conn, task_id, "budget_exception",
+                        {
+                            "actor": budget_exception_actor.strip(),
+                            "reason": budget_exception_reason.strip(),
+                            "measured_bytes": budget.measured_bytes,
+                            "limit_bytes": budget.limit_bytes,
+                            "worker_max_turns": budget.worker_max_turns,
+                            "policy_version": budget.policy_version,
+                        },
+                    )
                 if task_status == "blocked":
                     _append_event(
                         conn,
@@ -1789,6 +1915,38 @@ def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
         raise ValueError(f"unknown task {task_id}")
 
 
+def record_pr_continuation(
+    conn: sqlite3.Connection, task_id: str, *, actor: str, reason: str,
+) -> bool:
+    """Record an explicit operator decision to continue work on an existing PR.
+
+    The marker is accepted only while the task is ready to dispatch.  Generic
+    promotion and unblock events deliberately do not imply this authorization.
+    """
+    actor = (actor or "").strip()
+    reason = (reason or "").strip()
+    if not actor:
+        raise ValueError("PR continuation actor is required")
+    if not reason:
+        raise ValueError("PR continuation reason is required")
+    with write_txn(conn):
+        _require_task(conn, task_id)
+        if _task_status(conn, task_id) != "ready":
+            return False
+        latest_comment = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS id FROM task_comments WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        _append_event(
+            conn, task_id, "pr_continuation", {
+                "actor": actor,
+                "reason": reason,
+                "after_comment_id": int(latest_comment["id"] or 0),
+            },
+        )
+        return True
+
+
 def _task_rows(conn: sqlite3.Connection, table: str, task_id: str, order: str) -> list[sqlite3.Row]:
     return conn.execute(
         f"SELECT * FROM {table} WHERE task_id = ? ORDER BY {order}", (task_id,)
@@ -2146,6 +2304,11 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
+    from hermes_cli.kanban_jev_gate import JevAuthorizationError,authorize_existing_card,assert_existing_card_authorized
+    receipts={}
+    for row in conn.execute("SELECT id FROM tasks WHERE status='blocked'").fetchall():
+        try: receipts[row["id"]]=authorize_existing_card(conn,row["id"])
+        except JevAuthorizationError: pass
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
@@ -2154,6 +2317,9 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if cur_status == "blocked":
+                try: assert_existing_card_authorized(conn,task_id,receipts.get(task_id))
+                except JevAuthorizationError: continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Explicit human-intervention block; only ``unblock_task`` may exit it.
                 continue
@@ -2278,7 +2444,10 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    from hermes_cli.kanban_jev_gate import authorize_existing_card,assert_existing_card_authorized
+    receipt=authorize_existing_card(conn,task_id)
     with write_txn(conn):
+        assert_existing_card_authorized(conn,task_id,receipt)
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2311,7 +2480,10 @@ def claim_review_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    from hermes_cli.kanban_jev_gate import authorize_existing_card,assert_existing_card_authorized
+    receipt=authorize_existing_card(conn,task_id)
     with write_txn(conn):
+        assert_existing_card_authorized(conn,task_id,receipt)
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2733,6 +2905,8 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
+    _closure_capability: Any = None, _closure_report: Optional[dict] = None,
+    _closure_artifacts: Optional[dict] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2751,13 +2925,18 @@ def complete_task(
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
     """
+    from hermes_cli.kanban_closure_mutation import JevAuthorizationError, require_completion_capability
+    closure_authorized = require_completion_capability(
+        conn, task_id, _closure_capability, _closure_report,
+    )
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
-    _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    if not closure_authorized:
+        _gate_empty_completion(conn, task_id, result=result, summary=summary)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -2801,6 +2980,18 @@ def complete_task(
             params = (*params, int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
             return False
+        if closure_authorized:
+            # Revalidate the stage binding inside the final mutation transaction.
+            require_completion_capability(conn, task_id, _closure_capability, _closure_report)
+            if not isinstance(_closure_artifacts, dict) or not isinstance(_closure_artifacts.get("evidence_json"), str) or not isinstance(_closure_artifacts.get("document_bytes"), bytes):
+                raise ValueError("closure publication artifacts are incomplete")
+            binding=_closure_report["hermes_binding"]
+            evidence_bytes=_closure_artifacts["evidence_json"].encode()
+            document_bytes=_closure_artifacts["document_bytes"]
+            if hashlib.sha256(evidence_bytes).hexdigest()!=binding.get("evidence_sha256") or hashlib.sha256(document_bytes).hexdigest()!=binding.get("document_sha256"):
+                raise JevAuthorizationError("closure artifacts do not match authorized digests")
+            conn.execute("INSERT INTO task_closure_publications(task_id,evidence_json,document_bytes,evidence_sha256,document_sha256,authorization_json,created_at) VALUES (?,?,?,?,?,?,?)",(task_id,_closure_artifacts["evidence_json"],sqlite3.Binary(_closure_artifacts["document_bytes"]),binding["evidence_sha256"],binding["document_sha256"],json.dumps(_closure_report,sort_keys=True,separators=(",",":")),now))
+            _append_event(conn, task_id, "jev_closure_authorized", {"report": _closure_report,"mutate_board": False})
         if isinstance(metadata, dict):
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
@@ -3607,7 +3798,16 @@ def promote_task(
     if dry_run:
         return True, None
 
+    receipt=None
+    if cur_status=="blocked":
+        from hermes_cli.kanban_jev_gate import authorize_existing_card,assert_existing_card_authorized
+        receipt=authorize_existing_card(conn,task_id)
     with write_txn(conn):
+        actual = _task_status(conn, task_id)
+        if actual == "blocked":
+            assert_existing_card_authorized(conn,task_id,receipt)
+        elif actual != "todo":
+            return False, f"task {task_id} status changed during promotion"
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
@@ -3649,11 +3849,16 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None, author: Optional[str] = None) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
+    from hermes_cli.kanban_jev_gate import authorize_existing_card,assert_existing_card_authorized
+    task=get_task(conn,task_id)
+    if task is None or task.status not in {"blocked","scheduled"}: return False
+    receipt=authorize_existing_card(conn,task_id)
     now = int(time.time())
     with write_txn(conn):
+        assert_existing_card_authorized(conn,task_id,receipt)
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3682,6 +3887,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        if reason:
+            _insert_comment(conn, task_id, (author or "operator").strip() or "operator", f"UNBLOCK: {reason}", now)
         _append_event(
             conn, task_id, "unblocked",
             (
@@ -3824,6 +4031,23 @@ def invalidate_descendants_for_parent_reopen(
     return {"invalidated": invalidated, "terminations": terminations}
 
 
+def edit_task_content(conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None, body: Optional[str] = None) -> bool:
+    """Atomically validate and edit card content, clearing content-bound exceptions."""
+    if title is not None and not title.strip():
+        raise ValueError("title cannot be empty")
+    with write_txn(conn):
+        row=conn.execute("SELECT title,body,worker_max_turns FROM tasks WHERE id=?",(task_id,)).fetchone()
+        if row is None: return False
+        proposed_title=title.strip() if title is not None else (row["title"] or "")
+        proposed_body=body if body is not None else (row["body"] or "")
+        if proposed_title==(row["title"] or "") and proposed_body==(row["body"] or ""): return True
+        from hermes_cli.kanban_limits import evaluate_card_budget
+        evaluate_card_budget(proposed_title,proposed_body,worker_max_turns=row["worker_max_turns"])
+        conn.execute("UPDATE tasks SET title=?,body=?,budget_exception_reason=NULL,budget_exception_receipt=NULL,budget_exception_actor=NULL,budget_exception_at=NULL,budget_exception_measured_bytes=NULL,budget_exception_limit_bytes=NULL,budget_policy_version=NULL WHERE id=?",(proposed_title,proposed_body,task_id))
+        _append_event(conn,task_id,"edited",{"fields":[name for name,value in (("title",title),("body",body)) if value is not None]})
+    return True
+
+
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
@@ -3837,12 +4061,30 @@ def specify_triage_task(
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title, body, assignee, worker_max_turns, budget_exception_actor FROM tasks "
+            "WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
             return False
+        proposed_title = title.strip() if title is not None else (existing["title"] or "")
+        proposed_body = body if body is not None else (existing["body"] or "")
+        content_changed = proposed_title != (existing["title"] or "") or proposed_body != (existing["body"] or "")
+        if content_changed:
+            from hermes_cli.kanban_limits import evaluate_card_budget
+            # A prior exception authenticates the old bytes only. Content growth
+            # requires a fresh authorization; shrinking into budget clears it.
+            evaluate_card_budget(
+                proposed_title, proposed_body,
+                worker_max_turns=existing["worker_max_turns"],
+            )
         sets: list[str] = ["status = 'todo'"]
+        if content_changed and existing["budget_exception_actor"] is not None:
+            sets.extend([
+                "budget_exception_reason = NULL", "budget_exception_receipt = NULL", "budget_exception_actor = NULL",
+                "budget_exception_at = NULL", "budget_exception_measured_bytes = NULL",
+                "budget_exception_limit_bytes = NULL", "budget_policy_version = NULL",
+            ])
         params: list[Any] = []
         changed_fields: list[str] = []
         if title is not None and title.strip() != (existing["title"] or ""):
@@ -3895,7 +4137,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     termination outcome lands as its own ``archive_worker_termination`` event so
     the ``archived`` event stays atomic with the status flip.
     """
+    from hermes_cli.kanban_verified_archive import assert_ordinary_archive_allowed
     with write_txn(conn):
+        assert_ordinary_archive_allowed(conn, task_id)
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
             (task_id,),
@@ -3941,6 +4185,9 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         if _task_status(conn, task_id) != "archived":
             return False
+        from hermes_cli.kanban_verified_archive import hard_delete_is_protected
+        if hard_delete_is_protected(conn,task_id):
+            return False
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
@@ -3949,6 +4196,9 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and its related rows in one txn; False when not found."""
     with write_txn(conn):
+        from hermes_cli.kanban_verified_archive import hard_delete_is_protected
+        if hard_delete_is_protected(conn,task_id):
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -4202,6 +4452,166 @@ def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
 
 # --- Stats + SLA helpers ---
 
+_HARD_WORKER_OUTCOMES = frozenset({"crashed", "timed_out", "spawn_failed", "gave_up", "stale"})
+
+
+def _duration_summary(values: Iterable[int]) -> dict:
+    """Deterministic nearest-rank summary over non-negative integer seconds."""
+    import math
+
+    ordered = sorted(max(0, int(value)) for value in values)
+    if not ordered:
+        return {"count": 0, "min": None, "p50": None, "p95": None, "max": None}
+
+    def percentile(p: float) -> int:
+        return ordered[max(0, math.ceil(p * len(ordered)) - 1)]
+
+    return {
+        "count": len(ordered),
+        "min": ordered[0],
+        "p50": percentile(0.50),
+        "p95": percentile(0.95),
+        "max": ordered[-1],
+    }
+
+
+def cohort_metrics(
+    conn: sqlite3.Connection,
+    task_ids: Iterable[str],
+    *,
+    as_of: Optional[int] = None,
+) -> dict:
+    """Reproducible latency/failure metrics for an explicit cohort at a cutoff."""
+    ids = list(task_ids)
+    if not ids:
+        raise ValueError("cohort task IDs must not be empty")
+    if len(ids) != len(set(ids)):
+        raise ValueError("duplicate cohort task ID")
+    ids = sorted(ids)
+    cutoff = int(time.time()) if as_of is None else int(as_of)
+    placeholders = ",".join("?" for _ in ids)
+    tasks = conn.execute(
+        f"SELECT id, created_at, completed_at, status FROM tasks WHERE id IN ({placeholders})",
+        ids,
+    ).fetchall()
+    found = {row["id"] for row in tasks}
+    missing = sorted(set(ids) - found)
+    if missing:
+        raise ValueError("unknown cohort task ID(s): " + ", ".join(missing))
+    if any(int(row["created_at"]) > cutoff for row in tasks):
+        raise ValueError("cohort contains task(s) not yet created at as_of")
+
+    runs = conn.execute(
+        f"SELECT id, task_id, started_at, ended_at, outcome FROM task_runs "
+        f"WHERE task_id IN ({placeholders}) AND started_at <= ? ORDER BY task_id, started_at, id",
+        (*ids, cutoff),
+    ).fetchall()
+    by_task: dict[str, list] = {task_id: [] for task_id in ids}
+    outcomes: dict[str, int] = {}
+    active_runs = 0
+    run_durations: list[int] = []
+    clock_anomalies = 0
+    for run in runs:
+        by_task[run["task_id"]].append(run)
+        if run["ended_at"] is None or int(run["ended_at"]) > cutoff:
+            active_runs += 1
+            continue
+        outcome = run["outcome"] or "unknown"
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        duration = int(run["ended_at"]) - int(run["started_at"])
+        if duration < 0:
+            clock_anomalies += 1
+        run_durations.append(max(0, duration))
+
+    first_start: list[int] = []
+    retry_delays: list[int] = []
+    tasks_with_runs = 0
+    multi_run = 0
+    first_attempt_success = 0
+    closed_first_attempts = 0
+    for task in tasks:
+        task_runs = by_task[task["id"]]
+        if not task_runs:
+            continue
+        tasks_with_runs += 1
+        first_delay = int(task_runs[0]["started_at"]) - int(task["created_at"])
+        if first_delay < 0:
+            clock_anomalies += 1
+        first_start.append(max(0, first_delay))
+        first_ended = task_runs[0]["ended_at"]
+        if first_ended is not None and int(first_ended) <= cutoff:
+            closed_first_attempts += 1
+            if task_runs[0]["outcome"] == "completed":
+                first_attempt_success += 1
+        if len(task_runs) > 1:
+            multi_run += 1
+        for previous, current in zip(task_runs, task_runs[1:]):
+            if previous["ended_at"] is None or int(previous["ended_at"]) > cutoff:
+                continue
+            delay = int(current["started_at"]) - int(previous["ended_at"])
+            if delay < 0:
+                clock_anomalies += 1
+            retry_delays.append(max(0, delay))
+
+    terminal_times: list[int] = []
+    incomplete: list[str] = []
+    terminal_kinds={"completed","archived","verified_superseded_archive"}
+    nonterminal_kinds={"reopened","unblocked","promoted","promoted_manual","claimed","review_requested","review_reopened","changes_requested","reclaimed","blocked","scheduled","dependency_wait","descendant_invalidated","specified"}
+    for task in tasks:
+        terminal=None; saw_lifecycle=False
+        events=conn.execute("SELECT kind,payload,created_at FROM task_events WHERE task_id=? AND created_at<=? ORDER BY created_at,id",(task["id"],cutoff)).fetchall()
+        for event in events:
+            kind=event["kind"]
+            if kind in terminal_kinds:
+                terminal=int(event["created_at"]);saw_lifecycle=True
+            elif kind in nonterminal_kinds:
+                terminal=None;saw_lifecycle=True
+            elif kind=="status":
+                payload=_json_dict(event["payload"])
+                status=payload.get("status")
+                if status in VALID_STATUSES:
+                    terminal=int(event["created_at"]) if status in {"done","archived"} else None
+                    saw_lifecycle=True
+        if not saw_lifecycle and task["completed_at"] is not None and int(task["completed_at"])<=cutoff:
+            terminal=int(task["completed_at"])
+        if terminal is None: incomplete.append(task["id"])
+        else: terminal_times.append(terminal)
+    cohort_wall = None
+    if not incomplete:
+        cohort_wall = max(terminal_times) - min(int(task["created_at"]) for task in tasks)
+        if cohort_wall < 0:
+            clock_anomalies += 1
+            cohort_wall = 0
+
+    completed = outcomes.get("completed", 0)
+    hard_failures = sum(outcomes.get(name, 0) for name in _HARD_WORKER_OUTCOMES)
+
+    def rate(numerator: int, denominator: int) -> dict:
+        return {"numerator": numerator, "denominator": denominator,
+                "value": numerator / denominator if denominator else None}
+
+    return {
+        "cohort_task_ids": ids, "as_of": cutoff,
+        "task_counts": {"requested": len(ids), "with_runs": tasks_with_runs,
+                        "multiple_runs": multi_run, "incomplete": len(incomplete)},
+        "incomplete_task_ids": sorted(incomplete), "active_runs": active_runs,
+        "clock_anomalies": clock_anomalies,
+        "run_outcomes": dict(sorted(outcomes.items())),
+        "durations": {
+            "run_seconds": _duration_summary(run_durations),
+            "creation_to_first_start_seconds": _duration_summary(first_start),
+            "retry_delay_seconds": _duration_summary(retry_delays),
+            "cohort_wall_seconds": cohort_wall,
+        },
+        "rates": {
+            "worker_failure": rate(hard_failures, completed + hard_failures),
+            "blocked_run": rate(outcomes.get("blocked", 0), sum(outcomes.values())),
+            "retry": rate(multi_run, tasks_with_runs),
+            "first_attempt_success": rate(first_attempt_success, closed_first_attempts),
+        },
+    }
+
+
 def board_stats(conn: sqlite3.Connection) -> dict:
     """Per-status + per-assignee counts and the oldest ``ready`` age (staleness signal)."""
     by_status: dict[str, int] = {}
@@ -4304,7 +4714,7 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     cutoff = int(time.time()) - _retention_seconds(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
+            "DELETE FROM task_events WHERE created_at < ? AND kind NOT IN ('decomposed','gate_verdict','merge_verified','verified_superseded_archive') AND task_id IN "
             "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
         )
     return int(cur.rowcount or 0)
@@ -4511,88 +4921,3 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _worker_survived_termination,
     _worker_terminal_timeout_env,
 )
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-from typing import Mapping  # noqa: F401,E402
-from dataclasses import field  # noqa: F401,E402
-import hashlib  # noqa: F401,E402
-import random  # noqa: F401,E402
-import shutil  # noqa: F401,E402
-import threading  # noqa: F401,E402
-
-DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
-
-def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Optional[str]]]:
-    """Return ``(parent_id, result)`` for every done parent of ``task_id``."""
-    rows = conn.execute(
-        """
-        SELECT t.id AS id, t.result AS result
-        FROM tasks t
-        JOIN task_links l ON l.parent_id = t.id
-        WHERE l.child_id = ? AND t.status = 'done'
-        ORDER BY t.completed_at ASC
-        """,
-        (task_id,),
-    ).fetchall()
-    return [(r["id"], r["result"]) for r in rows]
-
-
-_PLUGIN_COMPAT_LAZY = {
-    'DEFAULT_BUSY_TIMEOUT_MS': ('hermes_cli.kanban_db_connect', 'DEFAULT_BUSY_TIMEOUT_MS'),
-    'DEFAULT_LOG_BACKUP_COUNT': ('hermes_cli.kanban_db_dispatch', 'DEFAULT_LOG_BACKUP_COUNT'),
-    'DEFAULT_LOG_ROTATE_BYTES': ('hermes_cli.kanban_db_dispatch', 'DEFAULT_LOG_ROTATE_BYTES'),
-    'DERIVED_MAX_IN_PROGRESS_CEILING': ('hermes_cli.kanban_db_dispatch', 'DERIVED_MAX_IN_PROGRESS_CEILING'),
-    'DERIVED_MAX_IN_PROGRESS_FLOOR': ('hermes_cli.kanban_db_dispatch', 'DERIVED_MAX_IN_PROGRESS_FLOOR'),
-    'KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS': ('hermes_cli.kanban_db_dispatch', 'KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS'),
-    'KanbanDbCorruptError': ('hermes_cli.kanban_db_connect', 'KanbanDbCorruptError'),
-    'MEMORY_GUARD_MB_PER_WORKER': ('hermes_cli.kanban_db_dispatch', 'MEMORY_GUARD_MB_PER_WORKER'),
-    'RepairResult': ('hermes_cli.kanban_db_connect', 'RepairResult'),
-    'add_notify_sub': ('hermes_cli.kanban_db_notify', 'add_notify_sub'),
-    'advance_notify_cursor': ('hermes_cli.kanban_db_notify', 'advance_notify_cursor'),
-    'check_respawn_guard': ('hermes_cli.kanban_db_dispatch', 'check_respawn_guard'),
-    'claim_unseen_events_for_sub': ('hermes_cli.kanban_db_notify', 'claim_unseen_events_for_sub'),
-    'configured_max_in_progress': ('hermes_cli.kanban_db_dispatch', 'configured_max_in_progress'),
-    'connect': ('hermes_cli.kanban_db_connect', 'connect'),
-    'connect_closing': ('hermes_cli.kanban_db_connect', 'connect_closing'),
-    'count_notify_subs': ('hermes_cli.kanban_db_notify', 'count_notify_subs'),
-    'count_running_tasks': ('hermes_cli.kanban_db_dispatch', 'count_running_tasks'),
-    'count_running_tasks_other_boards': ('hermes_cli.kanban_db_dispatch', 'count_running_tasks_other_boards'),
-    'derive_default_max_in_progress': ('hermes_cli.kanban_db_dispatch', 'derive_default_max_in_progress'),
-    'detect_crashed_workers': ('hermes_cli.kanban_db_dispatch', 'detect_crashed_workers'),
-    'detect_stale_running': ('hermes_cli.kanban_db_dispatch', 'detect_stale_running'),
-    'dispatch_once': ('hermes_cli.kanban_db_dispatch', 'dispatch_once'),
-    'enforce_max_runtime': ('hermes_cli.kanban_db_dispatch', 'enforce_max_runtime'),
-    'has_spawnable_ready': ('hermes_cli.kanban_db_dispatch', 'has_spawnable_ready'),
-    'has_spawnable_review': ('hermes_cli.kanban_db_dispatch', 'has_spawnable_review'),
-    'heartbeat_worker': ('hermes_cli.kanban_db_dispatch', 'heartbeat_worker'),
-    'list_notify_subs': ('hermes_cli.kanban_db_notify', 'list_notify_subs'),
-    'purge_stale_done_notify_subs': ('hermes_cli.kanban_db_notify', 'purge_stale_done_notify_subs'),
-    'reap_worker_zombies': ('hermes_cli.kanban_db_dispatch', 'reap_worker_zombies'),
-    'reconcile_orphaned_running': ('hermes_cli.kanban_db_dispatch', 'reconcile_orphaned_running'),
-    'remove_notify_sub': ('hermes_cli.kanban_db_notify', 'remove_notify_sub'),
-    'repair_db': ('hermes_cli.kanban_db_connect', 'repair_db'),
-    'resolve_max_in_progress': ('hermes_cli.kanban_db_dispatch', 'resolve_max_in_progress'),
-    'resolve_workspace': ('hermes_cli.kanban_db_workspace', 'resolve_workspace'),
-    'review_dispatch_enabled': ('hermes_cli.kanban_db_dispatch', 'review_dispatch_enabled'),
-    'rewind_notify_cursor': ('hermes_cli.kanban_db_notify', 'rewind_notify_cursor'),
-    'run_daemon': ('hermes_cli.kanban_db_dispatch', 'run_daemon'),
-    'set_branch_name': ('hermes_cli.kanban_db_workspace', 'set_branch_name'),
-    'set_workspace_path': ('hermes_cli.kanban_db_workspace', 'set_workspace_path'),
-    'unseen_events_for_sub': ('hermes_cli.kanban_db_notify', 'unseen_events_for_sub'),
-    'worker_log_rotation_config': ('hermes_cli.kanban_db_dispatch', 'worker_log_rotation_config'),
-}
-
-
-def __getattr__(name):  # PEP 562 — lazy so no import cycles
-    target = _PLUGIN_COMPAT_LAZY.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    import importlib
-    from hermes_cli.plugin_compat import warn_once
-    warn_once(__name__, name, *target)
-    return getattr(importlib.import_module(target[0]), target[1])
-# ---- END PLUGIN-COMPAT ----

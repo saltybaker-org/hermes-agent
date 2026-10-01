@@ -1171,3 +1171,34 @@ def test_board_card_exposes_current_run_start(client):
     # The detail endpoint carries the same contract.
     detail = client.get(f"/api/plugins/kanban/tasks/{t}").json()["task"]
     assert detail["current_run_started_at"] == retry_start
+
+
+def test_patch_title_body_rejects_oversize_without_mutation(client):
+    task=client.post("/api/plugins/kanban/tasks",json={"title":"small","body":"body"}).json()["task"]
+    response=client.patch(f"/api/plugins/kanban/tasks/{task['id']}",json={"body":"x"*9000})
+    assert response.status_code==400
+    detail=client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    assert detail["body"]=="body"
+
+
+def test_patch_title_body_clears_stale_exception_receipt(client):
+    task=client.post("/api/plugins/kanban/tasks",json={"title":"small","body":"body"}).json()["task"]
+    with kbc.connect_closing() as conn:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET budget_exception_reason='old',budget_exception_receipt='{}',budget_exception_actor='old',budget_exception_at=1,budget_exception_measured_bytes=9000,budget_exception_limit_bytes=8192,budget_policy_version='card-budget.v1' WHERE id=?",(task["id"],))
+    response=client.patch(f"/api/plugins/kanban/tasks/{task['id']}",json={"body":"remediated"})
+    assert response.status_code==200
+    with kbc.connect_closing() as conn:
+        stored=kb.get_task(conn,task["id"])
+        assert stored.budget_exception_receipt is None
+        assert stored.budget_exception_actor is None
+
+
+def test_delete_route_cannot_erase_rejected_gate(client):
+    from hermes_cli import kanban_verified_archive as kva
+    task=client.post("/api/plugins/kanban/tasks",json={"title":"rejected gate"}).json()["task"]
+    with kbc.connect_closing() as conn:
+        kva.record_gate_verdict(conn,task["id"],gate_kind="security",verdict="REJECT",candidate_sha="a"*40,reviewer="github:reviewer",author="github:author")
+    response=client.delete(f"/api/plugins/kanban/tasks/{task['id']}")
+    assert response.status_code != 200
+    assert client.get(f"/api/plugins/kanban/tasks/{task['id']}").status_code == 200

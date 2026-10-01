@@ -205,6 +205,10 @@ _SPECS = [
                   "the worker). Requires --model."),
         _arg("--completion-contract", metavar="CONTRACT",
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
+        _arg("--worker-max-turns", type=int, metavar="N", default=500,
+             help="Explicit per-card worker turn ceiling (1-500; default 500)."),
+        _arg("--budget-exception-receipt", metavar="REASON",
+             help="Local operator justification for an oversized card; recorded with actor and policy receipt."),
         _arg("--goal", action="store_true", dest="goal_mode",
              help="Run the worker in a goal loop: after each turn a judge checks the "
                   "response against the card title/body and, if not done, the worker "
@@ -219,6 +223,19 @@ _SPECS = [
                   "to skip the brief running-to-blocked transition."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
+    _cmd("construct-pipeline", [
+        _arg("manifest", help="fellowship-pipeline.v1 JSON manifest"),
+        _arg("cards", help="JSON array of complete card creation objects keyed like the manifest"),
+        _json_flag(help="Emit key-to-task-id mapping"),
+    ], help="Validate and atomically construct a complete JEV pipeline"),
+    _cmd("publish-closure", [
+        _TASK_ID,
+        _arg("evidence", help="fellowship-closure.v1 evidence JSON"),
+        _arg("document", help="Closure markdown document"),
+        _arg("--result", help="Task completion result"),
+        _arg("--summary", help="Task completion summary"),
+        _json_flag(help="Emit publication receipt"),
+    ], help="Validate closure evidence and atomically publish the closure task"),
     _cmd("swarm", [
         _arg("goal", help="Swarm goal / final outcome"),
         _arg("--worker", action="append", default=[], metavar="PROFILE:TITLE[:SKILL,SKILL]",
@@ -332,6 +349,10 @@ _SPECS = [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    _cmd("continue-pr", [
+        _TASK_ID,
+        _arg("reason", nargs="+", help="Why work should resume on the existing PR"),
+    ], help="Explicitly authorize a ready task to continue work on its existing PR"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),
@@ -359,6 +380,10 @@ _SPECS = [
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
     ], help="Archive one or more tasks"),
+    _cmd("verified-archive", [
+        _arg("manifest", help="Path to a kanban-verified-archive.v1 JSON manifest"),
+        _json_flag(help="Emit the verified archival receipt as JSON"),
+    ], help="Archive a superseded rejected gate after exact evidence verification"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),
@@ -386,6 +411,11 @@ _SPECS = [
         _arg("--interval", type=float, default=0.5, help="Poll interval in seconds (default: 0.5)"),
     ], help="Live-stream task_events to the terminal (Ctrl+C to exit)"),
     _cmd("stats", [_json_flag()], help="Per-status + per-assignee counts + oldest-ready age"),
+    _cmd("metrics", [
+        _arg("task_ids", nargs="+", help="Explicit cohort task IDs (membership is never inferred)"),
+        _arg("--as-of", type=int, help="Fixed epoch used in the report for reproducibility"),
+        _json_flag(),
+    ], help="Latency and failure metrics for an explicit task cohort"),
     _cmd("notify-subscribe", [
         _TASK_ID,
         *_NOTIFY_TARGET,

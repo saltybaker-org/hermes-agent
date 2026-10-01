@@ -784,6 +784,14 @@ def test_worker_lifecycle_through_tools(worker_env):
 # ---------------------------------------------------------------------------
 
 
+def test_kanban_guidance_prevents_blocked_parent_followup_deadlock():
+    """A gate that must block cannot parent the repair/review needed to unblock it."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "Never create that follow-up as your child" in KANBAN_GUIDANCE
+    assert "blocked parent -> todo child" in KANBAN_GUIDANCE
+    assert "block with evidence and request operator routing" in KANBAN_GUIDANCE
+    assert "repair/review -> continuation gate" in KANBAN_GUIDANCE
 # ---------------------------------------------------------------------------
 # Worker task-ownership enforcement (regression tests for #19534)
 # ---------------------------------------------------------------------------
@@ -1250,3 +1258,24 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_kanban_guidance_rejected_gate_blocks_instead_of_completes():
+    """A rejecting review/QA gate must not become done and promote merge."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "REQUEST_CHANGES or FAIL" in KANBAN_GUIDANCE
+    assert "must call `kanban_block`" in KANBAN_GUIDANCE
+    assert "Never call `kanban_complete` for a rejecting gate verdict" in KANBAN_GUIDANCE
+    assert "failed gate must not promote its downstream merge or release card" in KANBAN_GUIDANCE
+
+
+def test_kanban_guidance_blocks_on_unmet_external_acceptance():
+    """Local implementation is not completion when the card still requires publication."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "The task body's acceptance criteria always win" in KANBAN_GUIDANCE
+    assert "`local-only` does not waive explicit requirements" in KANBAN_GUIDANCE
+    assert "remote-ref readback" in KANBAN_GUIDANCE
+    assert "`kanban_block(kind=\"capability\"" in KANBAN_GUIDANCE
+    assert "Never call `kanban_complete` merely because local work is done" in KANBAN_GUIDANCE

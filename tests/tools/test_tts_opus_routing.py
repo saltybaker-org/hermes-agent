@@ -95,3 +95,18 @@ def test_edge_matrix_converts_to_opus_voice(tmp_path, monkeypatch):
     assert result["voice_compatible"] is True
     assert result["media_tag"] == f"[[audio_as_voice]]\nMEDIA:{opus}"
     convert.assert_called_once_with(str(out))
+
+
+def test_wav_finalizer_forces_opus_for_ogg(tmp_path, monkeypatch):
+    from tools import tts_tool_delivery as delivery
+
+    wav = tmp_path / "speech.wav"
+    out = tmp_path / "speech.ogg"
+    wav.write_bytes(b"wav")
+    calls = []
+    monkeypatch.setattr(delivery.shutil, "which", lambda _name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(delivery, "_ffmpeg_run", lambda _bin, args, **kwargs: calls.append(args))
+    monkeypatch.setattr(delivery, "_remove_quietly", lambda _path: None)
+
+    assert delivery._finalize_wav_output(str(wav), str(out)) == str(out)
+    assert calls and all(arg in calls[0] for arg in delivery._OPUS_VOICE_ARGS)

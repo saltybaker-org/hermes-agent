@@ -13,16 +13,17 @@ concurrency:
 
 jobs:
   test:
-    name: Run tests
-    # One 96-core runner for the whole suite. There is no slicing. Slicing
-    # existed to spread the suite over 4-core runners. It cost a matrix job, a
-    # duration cache, a per-slice artifact and a merge job to do it.
-    #
-    # 96 cores clear the floor that the slowest single test file sets (about
-    # 82s). A second slice divides work that is already at that floor, and
-    # adds a second setup.
-    runs-on: ubuntu-latest-96-core
-    timeout-minutes: 30
+    name: Run tests (${{ matrix.slice }})
+    # Upstream retains its single large-runner job. The lab fork has no access
+    # to that label, so all files run through sixteen disjoint standard-runner
+    # slices. Every slice is required; fail-fast is disabled to retain evidence.
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        slice: ${{ fromJSON(github.repository == 'saltybaker-org/hermes-agent' && '["1/16","2/16","3/16","4/16","5/16","6/16","7/16","8/16","9/16","10/16","11/16","12/16","13/16","14/16","15/16","16/16"]' || '["1/1"]') }}
+    runs-on: ${{ github.repository == 'saltybaker-org/hermes-agent' && 'ubuntu-latest' || 'ubuntu-latest-96-core' }}
+    timeout-minutes: ${{ github.repository == 'saltybaker-org/hermes-agent' && 90 || 30 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -104,11 +105,12 @@ jobs:
           # across a 6x range. The suite has sufficient concurrency at this
           # size. The remaining time is the slowest files plus the setup.
           # Workers above the core count only add contention.
-          HERMES_TEST_WORKERS: 96
+          HERMES_TEST_WORKERS: ${{ github.repository == 'saltybaker-org/hermes-agent' && '3' || '96' }}
+          HERMES_TEST_SLICE: ${{ matrix.slice }}
           # A healthy 44-test compression file takes ~197s alone and can exceed
           # the 300s default under 96-worker load before its duration is cached.
           # Match the runner's 3x known-slow headroom on the first PR run too.
-          HERMES_TEST_FILE_TIMEOUT: 600
+          HERMES_TEST_FILE_TIMEOUT: ${{ github.repository == 'saltybaker-org/hermes-agent' && '900' || '600' }}
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
@@ -121,13 +123,13 @@ jobs:
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: test_durations.json
-          key: test-durations-${{ github.run_id }}
+          key: test-durations-${{ github.run_id }}-${{ matrix.slice }}
 
   e2e:
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; a 4-vCPU runner serialises them into timeouts.
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    runs-on: ${{ github.repository == 'saltybaker-org/hermes-agent' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
+    timeout-minutes: ${{ github.repository == 'saltybaker-org/hermes-agent' && 90 || 30 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -191,11 +193,11 @@ jobs:
           # across unrelated SQLite, tenancy, provider and terminal suites.
           # Bound the trees, not the child readiness/turn timeouts. At 4 the
           # PTY turn and serve-SIGTERM deadlines still starved intermittently.
-          HERMES_TEST_WORKERS: "3"
+          HERMES_TEST_WORKERS: ${{ github.repository == 'saltybaker-org/hermes-agent' && '1' || '3' }}
           # Multi-process episodes (torture chamber, compaction kill -9,
           # gateway liveness, delivery exactly-once through a real gateway,
           # the cron virtual-clock soak) legitimately run past the 300 s default.
-          HERMES_TEST_FILE_TIMEOUT: "900"
+          HERMES_TEST_FILE_TIMEOUT: ${{ github.repository == 'saltybaker-org/hermes-agent' && '1800' || '900' }}
           # No automatic re-run of a failed file: the torture chamber and the
           # exactly-once/compaction suites are race detectors, and a rare
           # corruption that passes on retry is still a corruption.
@@ -244,8 +246,8 @@ jobs:
     # runs ~5-15 min. Sharded by suite directory (see e2e-upgrade-plan).
     name: e2e-upgrade (${{ matrix.shard }})
     needs: e2e-upgrade-plan
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 60
+    runs-on: ${{ github.repository == 'saltybaker-org/hermes-agent' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
+    timeout-minutes: ${{ github.repository == 'saltybaker-org/hermes-agent' && 120 || 60 }}
     strategy:
       fail-fast: false
       matrix:
@@ -354,7 +356,7 @@ jobs:
           # Each file drives real installs/updaters (process trees plus uv and
           # git I/O); cpu_count of them at once starves their deadlines. A
           # shard holds at most ~7 files, so this runs each shard in one wave.
-          HERMES_TEST_WORKERS: "6"
+          HERMES_TEST_WORKERS: ${{ github.repository == 'saltybaker-org/hermes-agent' && '2' || '6' }}
           HERMES_TEST_FILE_TIMEOUT: "3000"
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

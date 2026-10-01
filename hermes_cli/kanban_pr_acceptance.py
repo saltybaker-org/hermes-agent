@@ -39,17 +39,39 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
         result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
                                 text=True, encoding="utf-8", errors="replace", timeout=30,
                                 check=True, env=_gh_env(profile_home))
+        value = json.loads(result.stdout)
     except subprocess.CalledProcessError as exc:
-        # 401/403/404 = the login cannot see this repository (wrong profile identity
-        # or missing grant), not a transient API failure. Persist only the status
-        # code + endpoint, never gh's stderr (credentials/host details).
-        denied = re.search(r"HTTP (40[134])", exc.stderr or "")
-        if denied:
-            raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}") from None
-        if exc.returncode == 4:  # gh's authentication-required exit: this profile has no login
-            raise _GateAuthError(f"gh has no login for {endpoint.split('?')[0]}") from None
-        raise
-    value = json.loads(result.stdout)
+        if paginate and "unknown flag: --slurp" in (exc.stderr or ""):
+            fallback = [arg for arg in command if arg != "--slurp"]
+            try:
+                result = subprocess.run(
+                    fallback, stdin=subprocess.DEVNULL, capture_output=True,
+                    text=True, encoding="utf-8", errors="replace", timeout=30,
+                    check=True, env=_gh_env(profile_home),
+                )
+            except subprocess.CalledProcessError as fallback_exc:
+                exc = fallback_exc
+            else:
+                decoder = json.JSONDecoder()
+                value, offset = [], 0
+                while offset < len(result.stdout):
+                    while offset < len(result.stdout) and result.stdout[offset].isspace():
+                        offset += 1
+                    if offset >= len(result.stdout):
+                        break
+                    page, offset = decoder.raw_decode(result.stdout, offset)
+                    value.append(page)
+                exc = None
+        if exc is not None:
+            # 401/403/404 = the login cannot see this repository (wrong profile identity
+            # or missing grant), not a transient API failure. Persist only the status
+            # code + endpoint, never gh's stderr (credentials/host details).
+            denied = re.search(r"HTTP (40[134])", exc.stderr or "")
+            if denied:
+                raise _GateAuthError(f"HTTP {denied[1]} on {endpoint.split('?')[0]}") from None
+            if exc.returncode == 4:
+                raise _GateAuthError(f"gh has no login for {endpoint.split('?')[0]}") from None
+            raise exc
     if isinstance(value, dict) and value.get("errors"):
         raise ValueError("GitHub returned incomplete GraphQL evidence")
     return value
@@ -157,9 +179,14 @@ def collect_acceptance(contract: str, published_pr: str | None,
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
                         (app_id in (None, -1) or r["app"]["id"] == app_id)]
+            # GitHub retains older attempts when a workflow is rerun at the same
+            # SHA. Only the newest required context/app result is authoritative;
+            # otherwise a repaired green rerun remains permanently poisoned by
+            # historical failures. A newest pending/failure still blocks.
+            latest_run = max(matching, key=lambda r: r["id"]) if matching else None
             # A legacy status can satisfy an unpinned context, but never a check pinned to an app.
             legacy = [s for s in statuses if s["context"] == context] if app_id in (None, -1) else []
-            selected = matching + ([max(legacy, key=lambda s: s["id"])] if legacy else [])
+            selected = ([latest_run] if latest_run else []) + ([max(legacy, key=lambda s: s["id"])] if legacy else [])
             if not selected:
                 outcomes.append("missing")
                 receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha})

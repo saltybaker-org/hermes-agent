@@ -974,10 +974,19 @@ _PROTOCOL_VIOLATION_ERROR = (
 )
 
 
-_EXIT_SUMMARY_MARKER = "Resume this session with:"
 # Rich panel/rule chrome around the rendered response, and the CLI's own preamble lines.
 _LOG_CHROME = re.compile(r"[─━═╭╮╰╯│┃┌┐└┘]+|☤\s*Hermes")
-_LOG_NOISE_PREFIXES = ("session_id:", "Query:", "Initializing agent")
+
+
+def _exit_summary_marker() -> str:
+    """The CLI exit-summary header (``cli_session_mixin.show_exit_summary``), in the active language."""
+    from agent.i18n import t
+    return t("cli.session.exit_resume_hint")
+
+
+def _log_noise_prefixes() -> tuple[str, ...]:
+    from agent.i18n import t
+    return ("session_id:", "Query:", t("cli.chat.initializing_agent"))
 
 
 def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
@@ -1002,13 +1011,13 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
     if not raw:
         return ""
     raw = _EXIT_TRAILER_RE.sub("", raw)
-    cut = raw.rfind(_EXIT_SUMMARY_MARKER)
+    cut = raw.rfind(_exit_summary_marker())
     if cut != -1:
         raw = raw[:cut]
     lines = []
     for ln in raw.splitlines():
         ln = _LOG_CHROME.sub("", ln).strip()
-        if ln and not ln.startswith(_LOG_NOISE_PREFIXES):
+        if ln and not ln.startswith(_log_noise_prefixes()):
             lines.append(ln)
     return " ".join(lines)[-400:]
 
@@ -1618,25 +1627,43 @@ def check_respawn_guard(
     #    so the worker that opened the PR is still not re-spawned against it.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body, created_at FROM task_comments "
-        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
+        "SELECT id, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC, id DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         body = _kb._lossy_text(c["body"])
         if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
             continue
         events = conn.execute(
-            # Strictly after: a same-second tie stays guarded (fail closed).
-            "SELECT kind, payload FROM task_events "
-            "WHERE task_id = ? AND created_at > ? "
-            "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
-            (task_id, int(c["created_at"] or 0)),
+            "SELECT kind, payload, created_at FROM task_events "
+            "WHERE task_id = ? AND ("
+            "(created_at > ? AND kind IN ('assigned', 'changes_requested', 'review_reopened')) "
+            "OR (created_at >= ? AND kind = 'pr_continuation'))",
+            (task_id, int(c["created_at"] or 0), int(c["created_at"] or 0)),
         ).fetchall()
-        if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
+        if any(_is_handoff_after_comment(e, int(c["id"])) for e in events):
             return None
         return "active_pr"
 
     return None
+
+
+def _is_handoff_after_comment(event: sqlite3.Row, comment_id: int) -> bool:
+    """Return whether an event authorizes work after this exact PR comment.
+
+    ``created_at`` has whole-second precision, so a continuation records the
+    newest comment id visible in the same transaction. That durable sequence
+    marker permits same-second comment→continuation while preventing an older
+    continuation from authorizing a later PR comment.
+    """
+    kind = event["kind"]
+    if kind != "pr_continuation":
+        return _is_handoff_event(kind, event["payload"])
+    data = _kb._json_or(event["payload"], {})
+    if not isinstance(data, dict):
+        return False
+    marker = data.get("after_comment_id")
+    return isinstance(marker, int) and not isinstance(marker, bool) and marker >= comment_id
 
 
 def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
@@ -2033,6 +2060,63 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    # Re-authorize the complete durable row immediately before claim.
+    from hermes_cli.kanban_jev_gate import JevAuthorizationError, authorize_existing_card
+    try:
+        authorize_existing_card(conn, task_id)
+    except JevAuthorizationError as exc:
+        if dry_run:
+            result.respawn_guarded.append((task_id, "jev_policy"))
+            return False
+        with _kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='needs_input', "
+                "claim_lock=NULL, claim_expires=NULL WHERE id=? "
+                "AND status IN ('ready','review') AND claim_lock IS NULL",
+                (task_id,),
+            )
+            _kb._append_event(conn, task_id, "jev_dispatch_denied", {
+                "reason": str(exc), "mutate_board": False,
+            })
+        result.auto_blocked.append(task_id)
+        return False
+    # Re-check the durable row immediately before claim.  This is the
+    # non-bypassable backstop for imports, legacy DBs, direct SQL and any
+    # post-create content mutation that skipped create_task admission.
+    stored_task = _kb.get_task(conn, task_id)
+    if stored_task is None:
+        return False
+    try:
+        from hermes_cli.kanban_limits import (
+            BUDGET_POLICY_VERSION, CARD_BUDGET_BYTES, CardBudgetError,
+            validate_persisted_task_budget,
+        )
+        validate_persisted_task_budget(stored_task)
+    except CardBudgetError as exc:
+        if dry_run:
+            result.respawn_guarded.append((task_id, "budget_policy"))
+            return False
+        measured = len((stored_task.title + "\n" + (stored_task.body or "")).encode("utf-8"))
+        with _kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'needs_input', "
+                "claim_lock = NULL, claim_expires = NULL WHERE id = ? "
+                "AND status IN ('ready', 'review') AND claim_lock IS NULL",
+                (task_id,),
+            )
+            _kb._append_event(
+                conn, task_id, "budget_rejected",
+                {
+                    "reason": str(exc),
+                    "measured_bytes": measured,
+                    "limit_bytes": CARD_BUDGET_BYTES,
+                    "worker_max_turns": stored_task.worker_max_turns,
+                    "policy_version": BUDGET_POLICY_VERSION,
+                },
+            )
+
+        result.auto_blocked.append(task_id)
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -2762,7 +2846,10 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    cmd.extend([
+        "chat", "--max-turns", str(task.worker_max_turns),
+        "-q", f"work kanban task {task.id}",
+    ])
     # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).
     return cmd

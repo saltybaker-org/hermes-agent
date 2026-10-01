@@ -286,7 +286,13 @@ KANBAN_GUIDANCE = (
     "4. **Block on genuine ambiguity.** If you need a human decision you cannot infer (missing credentials, UX choice, "
     "paywalled source, peer output you need first), call `kanban_block(reason=\"...\")` and stop. Don't guess. The "
     "user will unblock with context and the dispatcher will respawn you.\n"
-    "5. **Finish with the review model encoded by the task graph.** Always include the structured handoff (`summary`, "
+    "5. **Do not close through an unmet external gate.** The task body's acceptance criteria always win. Read the "
+    "`completion_contract` reported by `kanban_show`; `local-only` does not waive explicit requirements in the body. If "
+    "completion still depends on a push, remote-ref readback, PR, CI run, review, deployment, credentialed action, or "
+    "other evidence you cannot perform and verify, record your local evidence with `kanban_comment`, then call "
+    "`kanban_block(kind=\"capability\", reason=...)`. Never call `kanban_complete` merely because local work is done, "
+    "and never let a pre-created child override an unmet criterion on your own card.\n"
+    "6. **Finish with the review model encoded by the task graph.** Always include the structured handoff (`summary`, "
     "`metadata`) on the lifecycle transition itself; never put secrets, tokens, or raw PII in these durable fields. If "
     "`kanban_show()` lists child IDs, inspect those cards with `kanban_show(task_id=...)` before choosing the terminal "
     "action. When any pre-created review, QA, or release child depends on your task, call `kanban_complete`: your "
@@ -296,11 +302,15 @@ KANBAN_GUIDANCE = (
     "`kanban_request_review(summary=..., metadata=..., reviewer=<optional-profile>)`. The reviewer approves with "
     "`kanban_complete`, returns actionable rework with `kanban_request_changes`, or uses `kanban_block` only for a "
     "genuine external escalation. Review is not a block, so repeated review cycles do not trip unblock-loop "
-    "detection.\n"
-    "6. **If follow-up work appears, create it; don't do it.** Use `kanban_create(title=..., assignee=<right-profile>, "
-    "parents=[your-task-id])` to spawn a child task for the appropriate specialist profile instead of scope-creeping "
-    "into the next thing.\n"
-    "7. **Flag collision hotspots; don't pile on.** If your change keeps colliding with sibling branches in one file, "
+    "detection. A pre-created review or QA gate that returns `REQUEST_CHANGES or FAIL` must call `kanban_block` "
+    "with its evidence and request operator-routed repair. Never call `kanban_complete` for a rejecting gate verdict: "
+    "a failed gate must not promote its downstream merge or release card.\n"
+    "7. **If follow-up work appears, create it; don't do it.** For ordinary work after you can complete, use "
+    "`kanban_create(title=..., assignee=<right-profile>, parents=[your-task-id])`. Exception: if your task must remain "
+    "blocked until that repair/review finishes, Never create that follow-up as your child: `blocked parent -> todo "
+    "child` is a deadlock; block with evidence and request operator routing so the graph is `repair/review -> "
+    "continuation gate`.\n"
+    "8. **Flag collision hotspots; don't pile on.** If your change keeps colliding with sibling branches in one file, "
     "or a file your diff touches shows up in other cards' recent comments, do not silently add more to it: leave a "
     "`kanban_comment` starting with `hotspot: <path> — <one-line reason>` on your card and repeat the flag in your "
     "completion metadata, so the orchestrator can decompose that file before more work lands on it.\n"
@@ -1778,26 +1788,3 @@ def build_context_files_prompt(
         return ""
     return ("# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n"
             + "\n".join(sections))
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-from typing import List  # noqa: F401,E402
-
-
-_PLUGIN_COMPAT_LAZY = {
-    'org_id_of_path': ('agent.skill_utils', 'org_id_of_path'),
-}
-
-
-def __getattr__(name):  # PEP 562 — lazy so no import cycles
-    target = _PLUGIN_COMPAT_LAZY.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    import importlib
-    from hermes_cli.plugin_compat import warn_once
-    warn_once(__name__, name, *target)
-    return getattr(importlib.import_module(target[0]), target[1])
-# ---- END PLUGIN-COMPAT ----
