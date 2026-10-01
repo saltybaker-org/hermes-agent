@@ -14,6 +14,8 @@ These commands are operator-only. They never approve, merge, deploy, enter secre
 
 Fellowship JEV `check-workspace` also accepts `--require-registered --upstream <ref> --require-path <relative>` (repeatable). It remains a separate CLI preflight; Hermes verifies equivalent git invariants locally because the sandboxed policy evaluator cannot read arbitrary host worktrees.
 
+The installed JEV 0.14.0 build at `3f198ece1e8d545736bf0526cfa47857d2dfda1b` emits `fellowship-authoritative-policy.v2`. Hermes requires that exact schema for create, unblock, pipeline and dispatch card authorization; a legacy v1 receipt is denied. Before enabling a live board, prove accepted and rejected cards through the actual bubblewrap-backed CLI on a disposable board, not by calling the executable without its sandbox.
+
 ## Exact PR target and credential boundary
 
 Cards using the audited wrappers declare `Repository: ` followed by a backtick-

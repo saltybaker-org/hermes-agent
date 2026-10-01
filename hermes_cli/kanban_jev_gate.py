@@ -101,7 +101,7 @@ def authorize_card(conn: sqlite3.Connection, card: dict) -> dict | None:
     report = _run(conn, ["decide-policy", "@card.json"], {"card.json": card})
     if report is None:
         return None
-    if report.get("schema_version") != "fellowship-authoritative-policy.v1" or report.get("authoritative") is not True or report.get("dispatch_allowed") is not True or report.get("mutate_board") is not False:
+    if report.get("schema_version") != "fellowship-authoritative-policy.v2" or report.get("authoritative") is not True or report.get("dispatch_allowed") is not True or report.get("mutate_board") is not False:
         raise JevAuthorizationError("JEV card authorization was not an explicit non-mutating allow")
     return report
 
