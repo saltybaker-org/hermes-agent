@@ -29,7 +29,7 @@ def _script(root,name,body):
 
 def test_direct_create_denial_leaves_no_row(board):
     conn,root=board
-    script=_script(root,"deny.py",'import json,sys; print(json.dumps({"schema_version":"fellowship-authoritative-policy.v1","authoritative":True,"dispatch_allowed":False,"mutate_board":False}));sys.exit(2)')
+    script=_script(root,"deny.py",'import json,sys; print(json.dumps({"schema_version":"fellowship-authoritative-policy.v2","authoritative":True,"dispatch_allowed":False,"mutate_board":False}));sys.exit(2)')
     _enable(root,script)
     with pytest.raises(gate.JevAuthorizationError):
         kb.create_task(conn,title="denied",body="invalid")
@@ -53,7 +53,7 @@ def test_direct_unblock_denial_preserves_blocked_state(board):
     conn,root=board
     task_id=kb.create_task(conn,title="blocked",body="card")
     with kb.write_txn(conn): conn.execute("UPDATE tasks SET status='blocked' WHERE id=?",(task_id,))
-    script=_script(root,"deny-unblock.py",'import json,sys; print(json.dumps({"schema_version":"fellowship-authoritative-policy.v1","authoritative":True,"dispatch_allowed":False,"mutate_board":False}));sys.exit(2)')
+    script=_script(root,"deny-unblock.py",'import json,sys; print(json.dumps({"schema_version":"fellowship-authoritative-policy.v2","authoritative":True,"dispatch_allowed":False,"mutate_board":False}));sys.exit(2)')
     _enable(root,script)
     with pytest.raises(gate.JevAuthorizationError): kb.unblock_task(conn,task_id)
     assert kb.get_task(conn,task_id).status=="blocked"
@@ -83,7 +83,7 @@ def test_direct_completion_cannot_publish_marked_closure(board):
 def test_dispatch_backstop_blocks_imported_card_before_spawn(board,all_assignees_spawnable):
     conn,root=board
     task_id=kb.create_task(conn,title="imported",body="body",assignee="worker")
-    script=_script(root,"deny-dispatch.py",'import json,sys; print(json.dumps({"schema_version":"fellowship-authoritative-policy.v1","authoritative":True,"dispatch_allowed":False,"mutate_board":False}));sys.exit(2)')
+    script=_script(root,"deny-dispatch.py",'import json,sys; print(json.dumps({"schema_version":"fellowship-authoritative-policy.v2","authoritative":True,"dispatch_allowed":False,"mutate_board":False}));sys.exit(2)')
     _enable(root,script)
     spawned=[]
     result=kbd.dispatch_once(conn,spawn_fn=lambda task,workspace,board=None: spawned.append(task.id) or 4)
@@ -112,7 +112,7 @@ def test_pipeline_card_denial_rolls_back_prior_cards(board):
 if sys.argv[1]=="validate-pipeline":
  print(json.dumps({"schema_version":"fellowship-pipeline-preflight.v1","ok":True,"mutate_board":False}));sys.exit(0)
 card=json.load(open(sys.argv[2]));allow=card["title"]!="deny"
-print(json.dumps({"schema_version":"fellowship-authoritative-policy.v1","authoritative":True,"dispatch_allowed":allow,"mutate_board":False}));sys.exit(0 if allow else 2)
+print(json.dumps({"schema_version":"fellowship-authoritative-policy.v2","authoritative":True,"dispatch_allowed":allow,"mutate_board":False}));sys.exit(0 if allow else 2)
 ''')
     _enable(root,script)
     cards=[{"key":"one","stage":"requirements","title":"allow","body":"body","assignee":"worker","parents":[]},
@@ -180,7 +180,7 @@ def test_closure_publication_succeeds_and_retains_exact_bytes(board):
 def test_dispatch_preflight_uses_full_durable_card_payload(board,all_assignees_spawnable):
     conn,root=board
     task_id=kb.create_task(conn,title="full",body="body",assignee="worker",priority=7,created_by="operator")
-    code="import json,sys;card=json.load(open(sys.argv[2]));allow=int(card.get('priority'))==7 and card.get('created_by')=='operator';print(json.dumps({'schema_version':'fellowship-authoritative-policy.v1','authoritative':True,'dispatch_allowed':allow,'mutate_board':False}));sys.exit(0 if allow else 2)"
+    code="import json,sys;card=json.load(open(sys.argv[2]));allow=int(card.get('priority'))==7 and card.get('created_by')=='operator';print(json.dumps({'schema_version':'fellowship-authoritative-policy.v2','authoritative':True,'dispatch_allowed':allow,'mutate_board':False}));sys.exit(0 if allow else 2)"
     script=_script(root,"full-card.py",code)
     _enable(root,script)
     report=gate.authorize_existing_card(conn,task_id)
@@ -220,7 +220,7 @@ def test_pipeline_external_evaluation_precedes_atomic_write(board,monkeypatch):
 
 def test_pipeline_exact_retry_returns_original_graph(board):
     from hermes_cli import kanban_pipeline_mutation as pipeline
-    conn,root=board;script=_script(root,"allow_retry.py",'import json,sys;print(json.dumps({"schema_version":"fellowship-pipeline-preflight.v1","ok":True,"mutate_board":False}) if sys.argv[1]=="validate-pipeline" else json.dumps({"schema_version":"fellowship-authoritative-policy.v1","authoritative":True,"dispatch_allowed":True,"mutate_board":False}))')
+    conn,root=board;script=_script(root,"allow_retry.py",'import json,sys;print(json.dumps({"schema_version":"fellowship-pipeline-preflight.v1","ok":True,"mutate_board":False}) if sys.argv[1]=="validate-pipeline" else json.dumps({"schema_version":"fellowship-authoritative-policy.v2","authoritative":True,"dispatch_allowed":True,"mutate_board":False}))')
     _enable(root,script)
     cards=[{"key":"one","stage":"requirements","title":"one","body":"body","assignee":"worker","parents":[]}];manifest={"schema_version":"fellowship-pipeline.v1","feature_id":"F-retry","cards":cards}
     first=pipeline.create_pipeline(conn,manifest,cards);second=pipeline.create_pipeline(conn,manifest,cards)
@@ -229,13 +229,13 @@ def test_pipeline_exact_retry_returns_original_graph(board):
 
 def test_pipeline_card_gate_receives_exact_durable_payload(board):
     from hermes_cli import kanban_pipeline_mutation as pipeline
-    conn,root=board;script=_script(root,"exact_card.py",'import json,sys\nif sys.argv[1]=="validate-pipeline": print(json.dumps({"schema_version":"fellowship-pipeline-preflight.v1","ok":True,"mutate_board":False}));sys.exit(0)\ncard=json.load(open(sys.argv[2]));allow=all(k in card for k in ("id","status","created_at","mutation_sha256","workspace_kind","parents"))\nprint(json.dumps({"schema_version":"fellowship-authoritative-policy.v1","authoritative":True,"dispatch_allowed":allow,"mutate_board":False}));sys.exit(0 if allow else 2)')
+    conn,root=board;script=_script(root,"exact_card.py",'import json,sys\nif sys.argv[1]=="validate-pipeline": print(json.dumps({"schema_version":"fellowship-pipeline-preflight.v1","ok":True,"mutate_board":False}));sys.exit(0)\ncard=json.load(open(sys.argv[2]));allow=all(k in card for k in ("id","status","created_at","mutation_sha256","workspace_kind","parents"))\nprint(json.dumps({"schema_version":"fellowship-authoritative-policy.v2","authoritative":True,"dispatch_allowed":allow,"mutate_board":False}));sys.exit(0 if allow else 2)')
     _enable(root,script)
     cards=[{"key":"one","stage":"requirements","title":"one","body":"body","assignee":"worker","parents":[]}];manifest={"schema_version":"fellowship-pipeline.v1","feature_id":"F-exact","cards":cards}
     assert pipeline.create_pipeline(conn,manifest,cards)["one"].startswith("t_")
 
 def test_closure_artifact_hashes_revalidated_inside_transaction(board,monkeypatch,tmp_path):
-    conn,root=board;script=_script(root,"closure_allow_hash.py",'import json,sys;print(json.dumps({"schema_version":"fellowship-closure-preflight.v1","ok":True,"mutate_board":False}) if sys.argv[1]=="validate-closure" else json.dumps({"schema_version":"fellowship-authoritative-policy.v1","authoritative":True,"dispatch_allowed":True,"mutate_board":False}))');_enable(root,script)
+    conn,root=board;script=_script(root,"closure_allow_hash.py",'import json,sys;print(json.dumps({"schema_version":"fellowship-closure-preflight.v1","ok":True,"mutate_board":False}) if sys.argv[1]=="validate-closure" else json.dumps({"schema_version":"fellowship-authoritative-policy.v2","authoritative":True,"dispatch_allowed":True,"mutate_board":False}))');_enable(root,script)
     task=kb.create_task(conn,title="closure");kb._append_event(conn,task,"pipeline_stage",{"stage":"closure_merge","feature_id":"F-hash"});doc=tmp_path/"closure.md";doc.write_text("exact")
     from hermes_cli import kanban_closure_mutation as closure
     original=kb.complete_task
@@ -269,7 +269,7 @@ def test_creator_session_is_bound_before_card_authorization(board,monkeypatch):
 
 def test_pipeline_blocked_status_precedes_triage(board):
     from hermes_cli import kanban_pipeline_mutation as pipeline
-    conn,root=board;script=_script(root,"allow_both.py",'import json,sys;print(json.dumps({"schema_version":"fellowship-pipeline-preflight.v1","ok":True,"mutate_board":False}) if sys.argv[1]=="validate-pipeline" else json.dumps({"schema_version":"fellowship-authoritative-policy.v1","authoritative":True,"dispatch_allowed":True,"mutate_board":False}))');_enable(root,script)
+    conn,root=board;script=_script(root,"allow_both.py",'import json,sys;print(json.dumps({"schema_version":"fellowship-pipeline-preflight.v1","ok":True,"mutate_board":False}) if sys.argv[1]=="validate-pipeline" else json.dumps({"schema_version":"fellowship-authoritative-policy.v2","authoritative":True,"dispatch_allowed":True,"mutate_board":False}))');_enable(root,script)
     cards=[{"key":"one","stage":"requirements","title":"one","triage":True,"initial_status":"blocked","parents":[]}];manifest={"schema_version":"fellowship-pipeline.v1","feature_id":"F-both","cards":cards}
     task=pipeline.create_pipeline(conn,manifest,cards)["one"]
     assert kb.get_task(conn,task).status=="blocked"
@@ -308,3 +308,19 @@ def test_sandbox_ignores_attacker_controlled_path(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(tmp_path))
     argv = gate._sandbox_argv(["/usr/local/bin/fellowship-jev"], ["decide-policy"], tmp_path)
     assert argv[0] == "/usr/bin/bwrap"
+
+
+def test_authoritative_policy_v2_accepts_current_jev(board):
+    conn, root = board
+    current = _script(root, "policy-v2.py", 'import json;print(json.dumps({"schema_version":"fellowship-authoritative-policy.v2","authoritative":True,"dispatch_allowed":True,"mutate_board":False}))')
+    _enable(root, current)
+    report = gate.authorize_card(conn, {"id": "current"})
+    assert report["schema_version"] == "fellowship-authoritative-policy.v2"
+
+
+def test_authoritative_policy_rejects_legacy_v1(board):
+    conn, root = board
+    legacy = _script(root, "policy-v1.py", 'import json;print(json.dumps({"schema_version":"fellowship-authoritative-policy.v1","authoritative":True,"dispatch_allowed":True,"mutate_board":False}))')
+    _enable(root, legacy)
+    with pytest.raises(gate.JevAuthorizationError, match="explicit non-mutating allow"):
+        gate.authorize_card(conn, {"id": "legacy"})
