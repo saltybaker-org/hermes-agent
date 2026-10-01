@@ -4,11 +4,17 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import os
+import hashlib
+import subprocess
 from typing import Any
+from pathlib import Path
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_trusted_gh import trusted_gh, trusted_gh_env
 
-SCHEMA_VERSION = "kanban-verified-archive.v1"
+SCHEMA_VERSION = "kanban-verified-archive.v2"
+LEGACY_SCHEMA_VERSION = "kanban-verified-archive.v1"
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 _PRINCIPAL = re.compile(r"^[a-z][a-z0-9._-]{0,31}:[A-Za-z0-9][A-Za-z0-9|@._-]{0,255}$")
 _REJECTED = frozenset({"REJECT", "FAIL"})
@@ -77,18 +83,118 @@ def record_gate_verdict(conn: sqlite3.Connection, task_id: str, *, gate_kind: st
         })
         return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
 
+def _digest(value: dict) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+def _gh_json(endpoint: str) -> dict:
+    try:
+        safe_env = trusted_gh_env()
+        proc = subprocess.run([trusted_gh(), "api", endpoint, "--hostname", "github.com"],
+                              cwd=safe_env["HOME"], env=safe_env,
+                              capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=30, check=True, stdin=subprocess.DEVNULL)
+        value = json.loads(proc.stdout)
+        if not isinstance(value, dict): raise ValueError("response is not an object")
+        return value
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        raise VerifiedArchiveDenied("authenticated GitHub read failed") from exc
+
+def _policy_path() -> Path:
+    # Do not allow a caller-controlled HERMES_HOME/HOME or board.json to appoint
+    # its own archiver. This Linux operator policy is outside worker mounts.
+    if os.name != "posix":
+        raise VerifiedArchiveDenied("archive authority policy requires a protected POSIX host")
+    import pwd
+    return Path(pwd.getpwuid(getattr(os, "getuid")()).pw_dir) / ".hermes" / "kanban" / "archive-authority.json"
+
+
+def _archive_policy() -> dict:
+    import stat
+    path = _policy_path()
+    try:
+        parent = path.parent.stat()
+        if parent.st_uid != getattr(os, "getuid")() or parent.st_mode & 0o077:
+            raise VerifiedArchiveDenied("archive authority policy directory is not owner-only")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != getattr(os, "getuid")() or info.st_mode & 0o077 or info.st_size > 4096:
+                raise VerifiedArchiveDenied("archive authority policy file is not owner-only")
+            raw = stream.read(4097)
+        if len(raw) > 4096:
+            raise VerifiedArchiveDenied("archive authority policy exceeds size limit")
+        def pairs(items):
+            result = {}
+            for key, value in items:
+                if key in result:
+                    raise ValueError("duplicate authority field")
+                result[key] = value
+            return result
+        policy = json.loads(raw.decode("utf-8-sig"), object_pairs_hook=pairs)
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        raise VerifiedArchiveDenied("archive authority policy is unavailable or malformed") from exc
+    allowed = policy.get("authorized_logins") if isinstance(policy, dict) else None
+    human = policy.get("human_merge_login") if isinstance(policy, dict) else None
+    valid = lambda login: isinstance(login, str) and re.fullmatch(r"[A-Za-z0-9-]{1,39}", login)
+    if not isinstance(allowed, list) or not allowed or not all(valid(x) for x in allowed) or not valid(human):
+        raise VerifiedArchiveDenied("archive authority policy has invalid principals")
+    return {"authorized_logins": {x.lower() for x in allowed}, "human_merge_login": human.lower()}
+
+
+def _authorized_login() -> str:
+    allowed = _archive_policy()["authorized_logins"]
+    login = _gh_json("user").get("login")
+    if not isinstance(login, str) or login.lower() not in allowed:
+        raise VerifiedArchiveDenied("authenticated GitHub caller is not an authorized archiver")
+    return login.lower()
+
+def collect_human_merge(pr_url: str, candidate_sha: str) -> dict:
+    """Collect GitHub's merged_by identity; never accept a caller-supplied claim."""
+    prefix = "https:" + "//github.com/"
+    match = re.fullmatch(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)", pr_url[len(prefix):]) if isinstance(pr_url, str) and pr_url.startswith(prefix) else None
+    if not match or not isinstance(candidate_sha, str) or not _SHA.fullmatch(candidate_sha):
+        raise VerifiedArchiveDenied("exact GitHub PR URL and candidate SHA required")
+    expected = _archive_policy()["human_merge_login"]
+    pr = _gh_json(f"repos/{match[1]}/pulls/{match[2]}")
+    merged_by = pr.get("merged_by")
+    merged_login = merged_by.get("login") if isinstance(merged_by, dict) else None
+    commit = pr.get("merge_commit_sha")
+    head = pr.get("head")
+    base_repo = (pr.get("base") or {}).get("repo") or {}
+    if (pr.get("html_url") != pr_url or pr.get("merged") is not True or
+        base_repo.get("full_name", "").lower() != match[1].lower() or
+        not pr.get("merged_at") or not isinstance(head, dict) or head.get("sha") != candidate_sha or
+        not isinstance(commit, str) or not _SHA.fullmatch(commit) or
+        not isinstance(merged_login, str) or merged_login.lower() != expected):
+        raise VerifiedArchiveDenied("PR is not merged by the configured human at the exact candidate head")
+    return {"schema_version": "kanban-human-merge.v1", "pr_url": pr_url,
+            "candidate_sha": candidate_sha, "merge_sha": commit,
+            "merged_by": merged_login.lower(), "merged_at": pr["merged_at"]}
+
 def record_merge_evidence(conn: sqlite3.Connection, task_id: str, *,
-                          candidate_sha: str, merge_sha: str) -> int:
-    if not isinstance(candidate_sha,str) or not isinstance(merge_sha,str) or not _SHA.fullmatch(candidate_sha) or not _SHA.fullmatch(merge_sha):
-        raise ValueError("candidate and merge SHAs must be 40 lowercase hex characters")
+                          candidate_sha: str, pr_url: str) -> int:
+    from hermes_cli.kanban_operator_seam import _card_repository, OperatorSeamError
+    task = kb.get_task(conn, task_id)
+    if task is None:
+        raise VerifiedArchiveDenied("unknown merge task")
+    rows = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='pr_target_bound' ORDER BY id", (task_id,)).fetchall()
+    if len(rows) != 1:
+        raise VerifiedArchiveDenied("exactly one prior PR target binding is required")
+    try:
+        binding = json.loads(rows[0]["payload"])
+        repo = _card_repository(task)
+    except (ValueError, TypeError, OperatorSeamError) as exc:
+        raise VerifiedArchiveDenied("invalid PR target binding") from exc
+    if (binding.get("pr_url") != pr_url or binding.get("head_sha") != candidate_sha or
+        binding.get("repository") != repo):
+        raise VerifiedArchiveDenied("merge PR differs from bound card target")
+    receipt = collect_human_merge(pr_url, candidate_sha)
     with kb.write_txn(conn):
         if kb.get_task(conn, task_id) is None:
-            raise ValueError("unknown merge task")
-        if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='merge_verified'", (task_id,)).fetchone():
-            raise ValueError("merge evidence is immutable")
-        kb._append_event(conn, task_id, "merge_verified", {
-            "candidate_sha": candidate_sha, "merge_sha": merge_sha, "verified": True,
-        })
+            raise VerifiedArchiveDenied("unknown merge task")
+        if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind IN ('merge_verified','human_merge_verified')", (task_id,)).fetchone():
+            raise VerifiedArchiveDenied("merge evidence is immutable")
+        kb._append_event(conn, task_id, "human_merge_verified", receipt)
         return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
 
 def _task(conn: sqlite3.Connection, task_id: Any, role: str):
@@ -113,7 +219,11 @@ def _verify_ref(conn: sqlite3.Connection, ref: Any) -> tuple[str, int, str]:
 def _retention_receipt_task_ids(owner_id:str,payload:Any)->set[str]:
     payload=_object(payload,"verified archive receipt")
     fields={"schema_version","replacement_task_id","gate_kind","candidate_sha","merge_task_id","merge_sha","replacement_verdict","required_child_ids","required_edges","evidence_refs"}
-    if set(payload)!=fields or payload.get("schema_version")!=SCHEMA_VERSION: raise VerifiedArchiveDenied("verified archive receipt schema is invalid")
+    version=payload.get("schema_version")
+    if version==SCHEMA_VERSION:
+        fields |= {"authorization","merge_pr_url","merge_receipt_sha256"}
+    if version not in {SCHEMA_VERSION, LEGACY_SCHEMA_VERSION} or set(payload)!=fields:
+        raise VerifiedArchiveDenied("verified archive receipt schema is invalid")
     replacement=payload.get("replacement_task_id");merge=payload.get("merge_task_id")
     if not isinstance(replacement,str) or not replacement or not isinstance(merge,str) or not merge: raise VerifiedArchiveDenied("verified archive receipt task identities are invalid")
     if payload.get("gate_kind") not in {"security","qa","closure_review"} or payload.get("replacement_verdict") not in _APPROVED: raise VerifiedArchiveDenied("verified archive receipt authority is invalid")
@@ -130,6 +240,11 @@ def _retention_receipt_task_ids(owner_id:str,payload:Any)->set[str]:
     for ref in refs:
         if not isinstance(ref,dict) or set(ref)!={"table","id","task_id"} or ref.get("table") not in _TABLES or isinstance(ref.get("id"),bool) or not isinstance(ref.get("id"),int) or ref["id"]<=0 or not isinstance(ref.get("task_id"),str) or not ref["task_id"]: raise VerifiedArchiveDenied("verified archive receipt reference schema is invalid")
         ref_tasks.add(ref["task_id"])
+    authorization=payload.get("authorization")
+    if version==SCHEMA_VERSION and (not isinstance(authorization,dict) or set(authorization)!={"actor_login","scope"} or authorization["scope"]!="archive-superseded-gate" or not isinstance(authorization["actor_login"],str) or not authorization["actor_login"]):
+        raise VerifiedArchiveDenied("verified archive authorization receipt is invalid")
+    if version==SCHEMA_VERSION and (not isinstance(payload.get("merge_pr_url"),str) or not isinstance(payload.get("merge_receipt_sha256"),str) or not re.fullmatch(r"[0-9a-f]{64}",payload["merge_receipt_sha256"])):
+        raise VerifiedArchiveDenied("verified archive merge receipt digest is invalid")
     return {owner_id,replacement,merge,*children,*ref_tasks}
 
 def hard_delete_is_protected(conn:sqlite3.Connection,task_id:str)->bool:
@@ -202,7 +317,7 @@ def _successful_terminal(conn:sqlite3.Connection,task)->bool:
 def verified_archive_superseded_gate(conn: sqlite3.Connection, manifest: dict) -> dict:
     """Verify all identities and evidence, then archive exactly one rejected gate."""
     manifest = _object(manifest, "manifest")
-    fields={"schema_version","gate_kind","rejected_task_id","replacement_task_id","replacement_verdict","candidate_sha","merge_task_id","merge_sha","required_child_ids","required_edges","evidence_refs"}
+    fields={"schema_version","gate_kind","rejected_task_id","replacement_task_id","replacement_verdict","candidate_sha","merge_task_id","merge_sha","required_child_ids","required_edges","evidence_refs","authorization","merge_pr_url","merge_receipt_sha256"}
     if set(manifest)!=fields: raise VerifiedArchiveDenied("manifest schema is closed")
     if manifest.get("schema_version") != SCHEMA_VERSION:
         raise VerifiedArchiveDenied("unsupported manifest schema")
@@ -231,6 +346,9 @@ def verified_archive_superseded_gate(conn: sqlite3.Connection, manifest: dict) -
     refs = manifest.get("evidence_refs")
     if not isinstance(refs, list) or not refs:
         raise VerifiedArchiveDenied("evidence_refs must be non-empty")
+    authorization = _object(manifest.get("authorization"), "archive authorization")
+    if set(authorization) != {"actor_login", "scope"} or authorization.get("scope") != "archive-superseded-gate" or authorization.get("actor_login") != _authorized_login():
+        raise VerifiedArchiveDenied("archive authorization does not match authenticated caller")
     with kb.write_txn(conn):
         rejected = _task(conn, manifest.get("rejected_task_id"), "rejected")
         replacement = _task(conn, manifest.get("replacement_task_id"), "replacement")
@@ -245,12 +363,14 @@ def verified_archive_superseded_gate(conn: sqlite3.Connection, manifest: dict) -
             raise VerifiedArchiveDenied("merge task must be terminal and successful")
         old = _event_payload(conn, rejected.id, "gate_verdict")
         new = _event_payload(conn, replacement.id, "gate_verdict")
-        merged = _event_payload(conn, merge_task.id, "merge_verified")
+        merged = _event_payload(conn, merge_task.id, "human_merge_verified")
         evidence_counts = {
             "rejected": conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='gate_verdict'", (rejected.id,)).fetchone()[0],
             "replacement": conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='gate_verdict'", (replacement.id,)).fetchone()[0],
-            "merge": conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='merge_verified'", (merge_task.id,)).fetchone()[0],
+            "merge": conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='human_merge_verified'", (merge_task.id,)).fetchone()[0],
         }
+        if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='merge_verified'", (merge_task.id,)).fetchone():
+            raise VerifiedArchiveDenied("legacy unauthenticated merge claim is not authority")
         if any(count != 1 for count in evidence_counts.values()):
             raise VerifiedArchiveDenied("duplicate or missing structured authority evidence")
         if old is None or new is None:
@@ -265,8 +385,8 @@ def verified_archive_superseded_gate(conn: sqlite3.Connection, manifest: dict) -
             raise VerifiedArchiveDenied("replacement gate kind mismatch")
         if old_payload.get("candidate_sha") != candidate or new_payload.get("candidate_sha") != candidate:
             raise VerifiedArchiveDenied("gate candidate SHA mismatch")
-        if merged is None or merged[1] != {"candidate_sha": candidate, "merge_sha": merge_sha, "verified": True}:
-            raise VerifiedArchiveDenied("merge evidence does not bind the exact candidate")
+        if merged is None or merged[1] != collect_human_merge(manifest["merge_pr_url"], candidate) or merged[1]["merge_sha"] != merge_sha or _digest(merged[1]) != manifest["merge_receipt_sha256"]:
+            raise VerifiedArchiveDenied("merge evidence does not bind the authenticated human merge")
         graph_rows = conn.execute(
             "WITH RECURSIVE ancestors(id) AS ("
             "SELECT parent_id FROM task_links WHERE child_id=? UNION "
@@ -310,6 +430,8 @@ def verified_archive_superseded_gate(conn: sqlite3.Connection, manifest: dict) -
             "required_child_ids": sorted(child_ids),
             "required_edges": [{"parent_id":p,"child_id":c} for p,c in sorted(required_edges)],
             "evidence_refs": [dict(ref) for ref in refs],
+            "authorization": authorization, "merge_pr_url": manifest["merge_pr_url"],
+            "merge_receipt_sha256": manifest["merge_receipt_sha256"],
         })
         after = {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                  for table in _TABLES.values()}
@@ -318,8 +440,53 @@ def verified_archive_superseded_gate(conn: sqlite3.Connection, manifest: dict) -
             raise VerifiedArchiveDenied("evidence retention invariant failed")
     return {"archived_task_id": rejected.id, "replacement_task_id": replacement.id,
             "candidate_sha": candidate, "merge_sha": merge_sha,
+            "merge_receipt_sha256": manifest["merge_receipt_sha256"],
+            "archive_manifest_sha256": _digest(manifest),
+            "authorized_actor": authorization["actor_login"],
             "schema_version": SCHEMA_VERSION}
 
+
+
+def build_archive_manifest(conn: sqlite3.Connection, rejected_id: str, replacement_id: str,
+                           merge_id: str) -> dict:
+    """Enumerate the complete current merge ancestry and exact authority rows.
+
+    This is a proposal, not a waiver: verified_archive_superseded_gate rechecks
+    each assertion under a write transaction and refuses graph drift.
+    """
+    rejected = _task(conn, rejected_id, "rejected")
+    replacement = _task(conn, replacement_id, "replacement")
+    merge = _task(conn, merge_id, "merge")
+    if len({rejected.id, replacement.id, merge.id}) != 3:
+        raise VerifiedArchiveDenied("archive roles must be distinct")
+    old = _event_payload(conn, rejected.id, "gate_verdict")
+    new = _event_payload(conn, replacement.id, "gate_verdict")
+    merged = _event_payload(conn, merge.id, "human_merge_verified")
+    if old is None or new is None or merged is None:
+        raise VerifiedArchiveDenied("structured gate and authenticated merge evidence required")
+    old_payload = _gate_payload(old[1], rejected.id)
+    new_payload = _gate_payload(new[1], replacement.id)
+    receipt = merged[1]
+    if set(receipt) != {"schema_version", "pr_url", "candidate_sha", "merge_sha", "merged_by", "merged_at"} or receipt.get("schema_version") != "kanban-human-merge.v1":
+        raise VerifiedArchiveDenied("malformed human merge receipt")
+    rows = conn.execute("WITH RECURSIVE ancestors(id) AS (SELECT parent_id FROM task_links WHERE child_id=? "
+                        "UNION SELECT l.parent_id FROM task_links l JOIN ancestors a ON l.child_id=a.id) "
+                        "SELECT id FROM ancestors", (merge.id,)).fetchall()
+    ids = sorted({row["id"] for row in rows} | {merge.id})
+    placeholders = ",".join("?" for _ in ids)
+    edges = conn.execute(f"SELECT parent_id,child_id FROM task_links WHERE parent_id IN ({placeholders}) "
+                         f"AND child_id IN ({placeholders}) ORDER BY parent_id,child_id", (*ids,*ids)).fetchall()
+    manifest = {"schema_version": SCHEMA_VERSION, "gate_kind": old_payload["gate_kind"],
+        "rejected_task_id": rejected.id, "replacement_task_id": replacement.id,
+        "replacement_verdict": new_payload["verdict"], "candidate_sha": old_payload["candidate_sha"],
+        "merge_task_id": merge.id, "merge_sha": receipt["merge_sha"],
+        "merge_pr_url": receipt["pr_url"], "merge_receipt_sha256": _digest(receipt),
+        "required_child_ids": ids,
+        "required_edges": [{"parent_id": row["parent_id"], "child_id": row["child_id"]} for row in edges],
+        "evidence_refs": [{"table": "event", "id": event[0], "task_id": task_id}
+                          for event,task_id in ((old,rejected.id),(new,replacement.id),(merged,merge.id))],
+        "authorization": {"actor_login": _authorized_login(), "scope": "archive-superseded-gate"}}
+    return manifest
 
 def load_manifest(path) -> dict:
     """Load JSON while rejecting duplicate object keys."""
@@ -331,6 +498,6 @@ def load_manifest(path) -> dict:
             result[key] = value
         return result
     try:
-        return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=pairs)
+        return json.loads(path.read_text(encoding="utf-8-sig"), object_pairs_hook=pairs)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise VerifiedArchiveDenied(f"unreadable archive manifest: {exc}") from exc

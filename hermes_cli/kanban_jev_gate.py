@@ -6,7 +6,6 @@ import os
 import sqlite3
 import subprocess
 import tempfile
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +32,7 @@ def _config(conn: sqlite3.Connection) -> dict | None:
     rows=conn.execute("PRAGMA database_list").fetchall();main=next((row for row in rows if row[1]=="main"),None)
     if main is None or not main[2]: return None
     path=Path(main[2]).resolve().parent/"board.json"
-    try: raw=json.loads(path.read_text(encoding="utf-8"))
+    try: raw=json.loads(path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError: return None
     except (OSError,UnicodeError,json.JSONDecodeError) as exc: raise JevAuthorizationError("enabled board JEV metadata is unreadable") from exc
     if not isinstance(raw,dict) or "jev_mutation_gate" not in raw: return None
@@ -53,11 +52,16 @@ def _trusted_command()->list[str]:
     return [str(path)]
 
 def _sandbox_argv(command:list[str],args:list[str],directory:Path)->list[str]:
-    bwrap=shutil.which("bwrap")
-    if not bwrap: raise JevAuthorizationError("JEV sandbox is unavailable")
-    argv=[bwrap,"--die-with-parent","--new-session","--unshare-net","--unshare-pid","--clearenv",
+    # A PATH-selected executable is attacker-controlled, not a sandbox boundary.
+    bwrap=Path("/usr/bin/bwrap")
+    try: binary_stat=bwrap.stat()
+    except OSError as exc: raise JevAuthorizationError("JEV sandbox is unavailable") from exc
+    if binary_stat.st_uid!=0 or binary_stat.st_mode & 0o022 or not bwrap.is_file():
+        raise JevAuthorizationError("JEV sandbox executable ownership is unsafe")
+    argv=[str(bwrap),"--die-with-parent","--new-session","--unshare-net","--unshare-pid","--clearenv",
           "--ro-bind","/usr","/usr","--ro-bind","/bin","/bin","--ro-bind","/lib","/lib"]
     if Path("/lib64").exists(): argv += ["--ro-bind","/lib64","/lib64"]
+    # no-tmp: ok — bubblewrap gives the isolated evaluator a private tmpfs, not host scratch.
     argv += ["--dev","/dev","--proc","/proc","--tmpfs","/tmp","--bind",str(directory),"/work",
              "--chdir","/work","--setenv","HOME","/work","--setenv","PATH","/usr/local/bin:/usr/bin:/bin",
              "--setenv","LANG","C.UTF-8","--"]
@@ -82,7 +86,7 @@ def _execute(cfg:dict,args:list[str],files:dict[str,dict|bytes])->dict:
         mapped=[str(resolved[item[1:]]) if item.startswith("@") else item for item in args]
         argv=_sandbox_argv(_trusted_command(),mapped,directory)
         try:
-            result=subprocess.run(argv,stdin=subprocess.DEVNULL,capture_output=True,text=True,
+            result=subprocess.run(argv,stdin=subprocess.DEVNULL,capture_output=True,text=True,encoding="utf-8",errors="replace",
                                   timeout=cfg["timeout"],check=False,env={"PATH":"/usr/bin:/bin","LANG":"C.UTF-8"},cwd="/")
         except (OSError,subprocess.TimeoutExpired) as exc: raise JevAuthorizationError(f"JEV authorization unavailable: {type(exc).__name__}") from exc
         report=_strict_json(result.stdout)

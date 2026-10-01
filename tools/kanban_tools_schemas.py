@@ -171,6 +171,8 @@ KANBAN_BLOCK_SCHEMA = _schema(
         "Set ``kind`` to say which: 'dependency' (waiting on another task — "
         "goes to todo and auto-resumes when that task finishes, no human "
         "needed), 'needs_input' (you need a human decision/answer), "
+        "'operator_wait' (a required operator handoff; blocks and wakes the "
+        "operator before this worker can continue), "
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
         "``reason`` is shown to the human on the board. If a task keeps "
@@ -187,12 +189,13 @@ KANBAN_BLOCK_SCHEMA = _schema(
         )),
         "kind": {
             "type": "string",
-            "enum": ["dependency", "needs_input", "capability", "transient"],
+            "enum": ["dependency", "needs_input", "operator_wait", "capability", "transient"],
             "description": (
                 "Why you're blocked. 'dependency' waits in todo and "
                 "resumes automatically when an incomplete parent finishes; "
                 "if no parent is open it is recorded as needs_input instead. "
-                "The others surface to a human. Omit only if none apply."
+                "'operator_wait' is a sticky operator handoff with a wake event; "
+                "the others surface to a human. Omit only if none apply."
             ),
         },
     },

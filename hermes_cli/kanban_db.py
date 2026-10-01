@@ -105,7 +105,7 @@ VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", 
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "operator_wait"}
 
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
@@ -665,6 +665,23 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     d = board_dir(normed)
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
+
+    db_path = d / "kanban.db"
+    if db_path.exists():
+        # Board-level rename/delete must not bypass per-card gate retention.
+        # Permanent deletion is restricted to empty boards: archival preserves
+        # the database and evidence, whereas rmtree destroys it wholesale.
+        from hermes_cli.kanban_verified_archive import assert_ordinary_archive_allowed
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as guard:
+            guard.row_factory = sqlite3.Row
+            rows = guard.execute("SELECT id,status FROM tasks").fetchall()
+            if rows and not archive:
+                raise ValueError("nonempty boards cannot be permanently deleted; archive instead")
+            for row in rows:
+                if row["status"] not in {"done", "archived"}:
+                    raise ValueError("board has nonterminal tasks; retire them before archiving")
+                if row["status"] == "done":
+                    assert_ordinary_archive_allowed(guard, row["id"])
 
     # If the user removed the currently-active board, revert to default.
     if get_current_board() == normed:
@@ -4714,7 +4731,7 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     cutoff = int(time.time()) - _retention_seconds(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind NOT IN ('decomposed','gate_verdict','merge_verified','verified_superseded_archive') AND task_id IN "
+            "DELETE FROM task_events WHERE created_at < ? AND kind NOT IN ('decomposed','gate_verdict','merge_verified','human_merge_verified','verified_superseded_archive') AND task_id IN "
             "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
         )
     return int(cur.rowcount or 0)

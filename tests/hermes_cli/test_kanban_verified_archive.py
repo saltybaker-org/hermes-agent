@@ -1,4 +1,5 @@
 from __future__ import annotations
+import sys
 import json
 from pathlib import Path
 import pytest
@@ -7,7 +8,18 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_verified_archive as kva
 
 @pytest.fixture
-def board(tmp_path):
+def board(tmp_path, monkeypatch):
+    policy = tmp_path / "archive-authority.json"
+    policy.write_text(json.dumps({"authorized_logins": ["bob"], "human_merge_login": "bob"}), encoding="utf-8")
+    policy.chmod(0o600)
+    monkeypatch.setattr(kva, "_policy_path", lambda: policy)
+    def gh(endpoint):
+        if endpoint == "user": return {"login": "bob"}
+        return {"html_url": "https:" + "//github.com/example/repo/pull/1", "merged": True,
+                "merged_at": "2026-09-30T00:00:00Z", "merged_by": {"login": "bob"},
+                "head": {"sha": "a" * 40}, "base": {"repo": {"full_name": "example/repo"}},
+                "merge_commit_sha": "b" * 40}
+    monkeypatch.setattr(kva, "_gh_json", gh)
     path=tmp_path/"kanban.db"
     kbc.init_db(path)
     conn=kbc.connect(path)
@@ -21,15 +33,22 @@ def _fixture(conn):
     sha="a"*40; merge="b"*40
     rejected=kb.create_task(conn,title="rejected",body="x")
     replacement=kb.create_task(conn,title="replacement",body="x")
-    merge_task=kb.create_task(conn,title="merge",body="x")
+    merge_task=kb.create_task(conn,title="merge",body="Repository: `example/repo`")
     assert kb.complete_task(conn,replacement,result="replacement gate approved");assert kb.complete_task(conn,merge_task,result="merge verified");_status(conn,rejected,"blocked")
     kb.link_tasks(conn,rejected,merge_task); kb.link_tasks(conn,replacement,merge_task)
     r=kva.record_gate_verdict(conn,rejected,gate_kind="security",verdict="REJECT",candidate_sha=sha,reviewer="hermes:reviewer",author="hermes:author")
     n=kva.record_gate_verdict(conn,replacement,gate_kind="security",verdict="APPROVE",candidate_sha=sha,reviewer="hermes:other",author="hermes:author")
-    m=kva.record_merge_evidence(conn,merge_task,candidate_sha=sha,merge_sha=merge)
+    with kb.write_txn(conn):
+        kb._append_event(conn, merge_task, "pr_target_bound", {
+            "pr_url":"https:" + "//github.com/example/repo/pull/1",
+            "head_sha":sha,"repository":"example/repo","head_ref":"feature","actor":"operator"})
+    m=kva.record_merge_evidence(conn,merge_task,candidate_sha=sha,pr_url="https:" + "//github.com/example/repo/pull/1")
     manifest={"schema_version":kva.SCHEMA_VERSION,"gate_kind":"security","rejected_task_id":rejected,
       "replacement_task_id":replacement,"replacement_verdict":"APPROVE","candidate_sha":sha,
       "merge_task_id":merge_task,"merge_sha":merge,
+      "merge_pr_url":"https:" + "//github.com/example/repo/pull/1",
+      "merge_receipt_sha256":kva._digest(kva._event_payload(conn,merge_task,"human_merge_verified")[1]),
+      "authorization":{"actor_login":"bob","scope":"archive-superseded-gate"},
       "required_child_ids":[rejected,replacement,merge_task],
       "required_edges":[{"parent_id":rejected,"child_id":merge_task},{"parent_id":replacement,"child_id":merge_task}],
       "evidence_refs":[{"table":"event","id":r,"task_id":rejected},{"table":"event","id":n,"task_id":replacement},{"table":"event","id":m,"task_id":merge_task}]}
@@ -250,3 +269,166 @@ def test_approved_gate_requires_ordinary_archive_before_hard_delete(board):
     assert kb.delete_task(board,task) is False
     assert kb.archive_task(board,task) is True
     assert kb.delete_archived_task(board,task) is True
+
+
+def test_manifest_builder_enumerates_all_ancestors_and_receipt(board):
+    rejected, replacement, merge_task, _ = _fixture(board)
+    extra = kb.create_task(board, title="publication", body="done")
+    assert kb.complete_task(board, extra, result="published")
+    with kb.write_txn(board):
+        board.execute("INSERT INTO task_links(parent_id,child_id) VALUES (?,?)", (extra, replacement))
+    _status(board, rejected, "blocked")
+    manifest = kva.build_archive_manifest(board, rejected, replacement, merge_task)
+    assert extra in manifest["required_child_ids"]
+    assert {"parent_id": extra, "child_id": replacement} in manifest["required_edges"]
+    receipt = kva.verified_archive_superseded_gate(board, manifest)
+    assert receipt["archive_manifest_sha256"] == kva._digest(manifest)
+    assert receipt["merge_receipt_sha256"] == manifest["merge_receipt_sha256"]
+
+
+def test_archive_requires_authenticated_authorized_caller(board, monkeypatch):
+    rejected, _, _, manifest = _fixture(board)
+    monkeypatch.setenv("HERMES_KANBAN_ARCHIVE_AUTHORIZED_LOGINS", "another-operator")
+    monkeypatch.setattr(kva, "_gh_json", lambda endpoint: {"login": "another-operator"})
+    with pytest.raises(kva.VerifiedArchiveDenied, match="authorized archiver"):
+        kva.verified_archive_superseded_gate(board, manifest)
+    assert kb.get_task(board, rejected).status == "blocked"
+
+
+def test_archiver_identity_cannot_be_substituted_in_manifest(board):
+    rejected, _, _, manifest = _fixture(board)
+    manifest["authorization"]["actor_login"] = "other"
+    with pytest.raises(kva.VerifiedArchiveDenied, match="authorization"):
+        kva.verified_archive_superseded_gate(board, manifest)
+    assert kb.get_task(board, rejected).status == "blocked"
+
+
+def test_claimed_human_name_does_not_impersonate_merged_by(board, monkeypatch):
+    merge_task = kb.create_task(board, title="merge", body="Repository: `example/repo`")
+    with kb.write_txn(board):
+        kb._append_event(board, merge_task, "pr_target_bound", {
+            "pr_url":"https:" + "//github.com/example/repo/pull/1", "head_sha":"a"*40,
+            "repository":"example/repo", "head_ref":"feature", "actor":"operator"})
+    monkeypatch.setattr(kva, "_gh_json", lambda endpoint: {"html_url": "https:" + "//github.com/example/repo/pull/1",
+        "merged": True, "merged_at": "2026-09-30T00:00:00Z", "merged_by": {"login": "bot"},
+        "head": {"sha": "a"*40}, "base": {"repo": {"full_name": "example/repo"}},
+         "merge_commit_sha": "b"*40})
+    with pytest.raises(kva.VerifiedArchiveDenied, match="configured human"):
+        kva.record_merge_evidence(board, merge_task, candidate_sha="a"*40,
+            pr_url="https:" + "//github.com/example/repo/pull/1")
+    assert kva._event_payload(board, merge_task, "human_merge_verified") is None
+
+
+def test_archive_rejects_tampered_digest_and_stale_merge(board, monkeypatch):
+    rejected, _, _, manifest = _fixture(board)
+    manifest["merge_receipt_sha256"] = "0"*64
+    with pytest.raises(kva.VerifiedArchiveDenied, match="authenticated human merge"):
+        kva.verified_archive_superseded_gate(board, manifest)
+    assert kb.get_task(board, rejected).status == "blocked"
+    monkeypatch.setattr(kva, "collect_human_merge", lambda *args: {"stale": True})
+    with pytest.raises(kva.VerifiedArchiveDenied, match="authenticated human merge"):
+        kva.verified_archive_superseded_gate(board, manifest)
+
+
+def test_legacy_v1_archive_receipt_remains_delete_protected(board):
+    rejected, replacement, merge_task, manifest = _fixture(board)
+    kva.verified_archive_superseded_gate(board, manifest)
+    row = board.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='verified_superseded_archive'", (rejected,)).fetchone()
+    payload = json.loads(row["payload"])
+    payload["schema_version"] = kva.LEGACY_SCHEMA_VERSION
+    for field in ("authorization", "merge_pr_url", "merge_receipt_sha256"):
+        payload.pop(field)
+    with kb.write_txn(board):
+        board.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"]))
+    for task in (rejected, replacement, merge_task):
+        assert kb.delete_task(board, task) is False
+
+
+def test_merge_collector_cli_response_digest_and_worker_denial(board, monkeypatch, capsys):
+    import argparse
+    from contextlib import contextmanager
+    from hermes_cli import kanban as cli
+    task = kb.create_task(board, title="merge receipt", body="Repository: `example/repo`")
+    with kb.write_txn(board):
+        kb._append_event(board, task, "pr_target_bound", {
+            "pr_url":"https:" + "//github.com/example/repo/pull/1", "head_sha":"a"*40,
+            "repository":"example/repo", "head_ref":"feature", "actor":"operator"})
+    @contextmanager
+    def connection():
+        yield board
+    monkeypatch.setattr(cli.kbc, "connect_closing", connection)
+    args = argparse.Namespace(task_id=task, candidate_sha="a"*40,
+        pr_url="https:" + "//github.com/example/repo/pull/1", json=True)
+    assert cli._cmd_collect_human_merge(args) == 0
+    response = json.loads(capsys.readouterr().out)
+    assert response["evidence_sha256"] == kva._digest(response["evidence"])
+    assert response["evidence"]["merged_by"] == "bob"
+    assert response["event_id"] == kva._event_payload(board, task, "human_merge_verified")[0]
+    other = kb.create_task(board, title="another merge")
+    args.task_id = other
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "worker")
+    assert cli._cmd_collect_human_merge(args) == 2
+    assert kva._event_payload(board, other, "human_merge_verified") is None
+
+
+def test_human_merge_evidence_requires_this_cards_pr_binding(board):
+    task = kb.create_task(board, title="merge", body="Repository: `example/repo`")
+    with pytest.raises(kva.VerifiedArchiveDenied, match="binding"):
+        kva.record_merge_evidence(board, task, candidate_sha="a"*40,
+            pr_url="https:" + "//github.com/example/repo/pull/1")
+    assert kva._event_payload(board, task, "human_merge_verified") is None
+
+
+def test_environment_cannot_self_authorize_archive(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_ARCHIVE_AUTHORIZED_LOGINS", "attacker")
+    monkeypatch.setenv("HERMES_KANBAN_HUMAN_MERGE_LOGIN", "attacker")
+    monkeypatch.setattr(kva, "_gh_json", lambda endpoint: {"login": "attacker"})
+    monkeypatch.setattr(kva, "_policy_path", lambda: Path("/nonexistent/archive-authority.json"))
+    with pytest.raises(kva.VerifiedArchiveDenied, match="archive authority policy"):
+        kva._authorized_login()
+
+
+@pytest.mark.parametrize("unsafe", ["world_writable", "symlink", "duplicate_key"])
+def test_archive_authority_policy_file_must_be_private(tmp_path, monkeypatch, unsafe):
+    policy = tmp_path / "archive-authority.json"
+    content = '{"authorized_logins":["bob"],"human_merge_login":"bob"}'
+    if unsafe == "duplicate_key":
+        content = '{"authorized_logins":["bob"],"authorized_logins":["attacker"],"human_merge_login":"bob"}'
+    target = tmp_path / "target.json" if unsafe == "symlink" else policy
+    target.write_text(content, encoding="utf-8")
+    target.chmod(0o600)
+    if unsafe == "symlink":
+        policy.symlink_to(target)
+    elif unsafe == "world_writable":
+        policy.chmod(0o666)
+    monkeypatch.setattr(kva, "_policy_path", lambda: policy)
+    with pytest.raises(kva.VerifiedArchiveDenied, match="archive authority policy"):
+        kva._authorized_login()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux operator binary trust anchor")
+def test_merge_evidence_uses_trusted_github_binary(monkeypatch):
+    from types import SimpleNamespace
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(stdout='{"login":"bob"}')
+    monkeypatch.setattr(kva.subprocess, "run", run)
+    assert kva._gh_json("user") == {"login": "bob"}
+    assert calls[0][0] == "/usr/bin/gh"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux operator environment isolation")
+def test_merge_readback_scrubs_caller_environment(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setenv("LD_PRELOAD", "/untrusted/agent-hook.so")
+    monkeypatch.setenv("GH_TOKEN", "untrusted-token")
+    seen = []
+    def run(argv, **kwargs):
+        seen.append(kwargs)
+        return SimpleNamespace(stdout='{"login":"bob"}')
+    monkeypatch.setattr(kva.subprocess, "run", run)
+    assert kva._gh_json("user") == {"login": "bob"}
+    assert "LD_PRELOAD" not in seen[0]["env"]
+    assert "GH_TOKEN" not in seen[0]["env"]
+    assert seen[0]["cwd"] == seen[0]["env"]["HOME"]

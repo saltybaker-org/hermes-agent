@@ -349,10 +349,32 @@ _SPECS = [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
+    _cmd("resolve-triage", [
+        _TASK_ID,
+        _arg("--verdict", required=True, help="Recorded successful verdict (never a rejecting gate)"),
+        _arg("--reason", required=True, help="Auditable operator rationale"),
+        _json_flag(),
+    ], help="Resolve a triaged card with a documented successful verdict"),
     _cmd("continue-pr", [
         _TASK_ID,
         _arg("reason", nargs="+", help="Why work should resume on the existing PR"),
     ], help="Explicitly authorize a ready task to continue work on its existing PR"),
+    _cmd("operator-wake", [
+        _TASK_ID, _arg("reason", nargs="+", help="Audited reason for waking typed operator wait"),
+    ], help="Unblock an operator_wait card, dispatch and verify heartbeat"),
+    _cmd("operator-bind-pr", [
+        _TASK_ID, _arg("--pr-url", required=True), _arg("--head-sha", required=True),
+        _arg("reason", nargs="+", help="Why this PR is the immutable target of this card"),
+    ], help="Bind an exact GitHub PR to the card's declared repository"),
+    _cmd("operator-continue-pr", [
+        _TASK_ID, _arg("--pr-url", required=True), _arg("--head-sha", required=True),
+        _arg("reason", nargs="+", help="Scoped reason to continue exact open PR"),
+    ], help="Verify exact open PR head, authorize, dispatch and verify heartbeat"),
+    _cmd("operator-publish-pr", [
+        _TASK_ID, _arg("--repo", required=True), _arg("--remote", required=True),
+        _arg("--base", required=True),
+        _arg("reason", nargs="+", help="Scoped publication reason"),
+    ], help="Disabled: publish in trusted operator checkout, then bind and continue exact PR"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),
@@ -380,8 +402,15 @@ _SPECS = [
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
     ], help="Archive one or more tasks"),
+    _cmd("collect-human-merge", [
+        _TASK_ID, _arg("--pr-url", required=True), _arg("--candidate-sha", required=True),
+        _json_flag(),
+    ], help="Read GitHub merged_by under owner-only archive policy and record immutable evidence"),
+    _cmd("archive-manifest", [
+        _arg("rejected_task_id"), _arg("replacement_task_id"), _arg("merge_task_id"),
+    ], help="Print graph-enumerated manifest (requires owner-only archive policy and authenticated gh)"),
     _cmd("verified-archive", [
-        _arg("manifest", help="Path to a kanban-verified-archive.v1 JSON manifest"),
+        _arg("manifest", help="Path to a kanban-verified-archive.v2 JSON manifest"),
         _json_flag(help="Emit the verified archival receipt as JSON"),
     ], help="Archive a superseded rejected gate after exact evidence verification"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),

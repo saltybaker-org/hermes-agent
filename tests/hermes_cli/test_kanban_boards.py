@@ -159,7 +159,7 @@ class TestBoardCRUD:
         # on Windows an open connection locks kanban.db so remove_board's
         # rename below fails with WinError 5/32.
         with kbc.connect_closing(board="recycle") as conn:
-            kb.create_task(conn, title="t1", assignee="dev")
+            assert conn.execute("SELECT name FROM sqlite_master WHERE name='tasks'").fetchone()
         db_path = kb.board_dir("recycle") / "kanban.db"
         assert str(db_path.resolve()) in kb._INITIALIZED_PATHS
 
@@ -335,3 +335,29 @@ class TestCLI:
 
 
 
+
+
+def test_board_removal_cannot_delete_evidence_or_hide_unfinished_work(fresh_home):
+    kb.create_board("protected")
+    with kbc.connect_closing(board="protected") as conn:
+        task = kb.create_task(conn, title="unresolved", assignee="dev")
+    with pytest.raises(ValueError, match="nonempty boards"):
+        kb.remove_board("protected", archive=False)
+    with pytest.raises(ValueError, match="nonterminal tasks"):
+        kb.remove_board("protected", archive=True)
+    assert kb.board_exists("protected")
+
+
+def test_board_archive_refuses_unverified_rejected_gate(fresh_home):
+    from hermes_cli import kanban_verified_archive as kva
+    kb.create_board("rejected-board")
+    with kbc.connect_closing(board="rejected-board") as conn:
+        task = kb.create_task(conn, title="rejected QA", assignee="qa")
+        kva.record_gate_verdict(conn, task, gate_kind="qa", verdict="FAIL",
+            candidate_sha="a" * 40, reviewer="hermes:qa", author="hermes:builder")
+        # Even an incorrect done status must not make rejected evidence removable.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task,))
+    with pytest.raises(kva.VerifiedArchiveDenied, match="rejected"):
+        kb.remove_board("rejected-board", archive=True)
+    assert kb.board_exists("rejected-board")

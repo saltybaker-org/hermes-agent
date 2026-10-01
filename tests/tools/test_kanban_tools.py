@@ -1279,3 +1279,20 @@ def test_kanban_guidance_blocks_on_unmet_external_acceptance():
     assert "remote-ref readback" in KANBAN_GUIDANCE
     assert "`kanban_block(kind=\"capability\"" in KANBAN_GUIDANCE
     assert "Never call `kanban_complete` merely because local work is done" in KANBAN_GUIDANCE
+
+
+def test_goal_mode_worker_can_request_operator_wait(monkeypatch, tmp_path):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    result = json.loads(kt._handle_block({"reason": "waiting for operator handoff", "kind": "operator_wait"}))
+    assert (result.get("ok"), result.get("status"), result.get("block_kind")) == (True, "blocked", "operator_wait")
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, tid).block_kind == "operator_wait"
+
+
+def test_operator_wait_is_exposed_in_worker_block_schema():
+    from tools.kanban_tools_schemas import KANBAN_BLOCK_SCHEMA
+    assert "operator_wait" in KANBAN_BLOCK_SCHEMA["parameters"]["properties"]["kind"]["enum"]
+    assert "operator_wait" in KANBAN_BLOCK_SCHEMA["description"]

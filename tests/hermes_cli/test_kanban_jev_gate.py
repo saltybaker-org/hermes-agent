@@ -299,3 +299,12 @@ def test_publish_closure_cli_completes_the_exact_live_worker_run(board,monkeypat
     row=conn.execute("SELECT evidence_json,document_bytes FROM task_closure_publications WHERE task_id=?",(task_id,)).fetchone()
     assert json.loads(row["evidence_json"])=={"feature_id":"F-cli"}
     assert bytes(row["document_bytes"])==b"exact cli closure"
+
+
+def test_sandbox_ignores_attacker_controlled_path(tmp_path, monkeypatch):
+    fake = tmp_path / "bwrap"
+    fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    argv = gate._sandbox_argv(["/usr/local/bin/fellowship-jev"], ["decide-policy"], tmp_path)
+    assert argv[0] == "/usr/bin/bwrap"

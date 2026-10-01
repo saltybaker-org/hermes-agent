@@ -1,0 +1,63 @@
+name: Lab main narrow controls
+
+# The lab integration branch is deliberately separate from protected main and
+# its complete CI. No release or main/PR #1 gate is replaced by this workflow.
+on:
+  pull_request:
+    branches: [lab/main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lab-main-controls-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  controls:
+    name: Lab narrow controls gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout reviewed PR head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Prepare locked Python and test dependencies
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
+          test-environment: 'true'
+
+      - name: Install local sandbox test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap ripgrep
+
+      - name: Require WAL-capable SQLite
+        run: |
+          "$HERMES_PYTHON" -c "import sqlite3, sys, hermes_state_wal as w; v = w.is_sqlite_wal_reset_vulnerable(); print(f'Python {sys.version.split()[0]}, SQLite {sqlite3.sqlite_version}, WAL-reset vulnerable: {v}'); sys.exit(1 if v else 0)"
+
+      - name: Run static security and portability checks
+        run: |
+          "$HERMES_PYTHON" -m ruff check .
+          "$HERMES_PYTHON" scripts/check-windows-footguns.py --all
+          "$HERMES_PYTHON" scripts/check_no_tmp_literals.py
+          "$HERMES_PYTHON" scripts/check_config_yaml_writers.py
+          "$HERMES_PYTHON" scripts/check_bash_shebangs.py
+
+      - name: Run affected controls and workflow-contract tests
+        # This unrelated systemd scope test fails on the unmodified deployed
+        # base in the operator environment; worker-spawn semantics remain in
+        # main's full CI. No changed control test is excluded.
+        run: |
+          "$HERMES_PYTHON" -m pytest -q \
+            --deselect=tests/hermes_cli/test_kanban_boards.py::TestWorkerSpawnEnv::test_default_spawn_sets_env_vars \
+            tests/hermes_cli/test_kanban_f003_preflight.py \
+            tests/hermes_cli/test_kanban_f003_operator_seam.py \
+            tests/hermes_cli/test_kanban_triage_resolution.py \
+            tests/hermes_cli/test_kanban_verified_archive.py \
+            tests/hermes_cli/test_kanban_jev_gate.py \
+            tests/hermes_cli/test_kanban_boards.py \
+            tests/tools/test_kanban_tools.py \
+            tests/test_managed_runtime_resolution.py \
+            tests/test_lab_main_ci_contract.py
