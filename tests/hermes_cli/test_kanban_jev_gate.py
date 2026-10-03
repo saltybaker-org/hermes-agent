@@ -324,3 +324,84 @@ def test_authoritative_policy_rejects_legacy_v1(board):
     _enable(root, legacy)
     with pytest.raises(gate.JevAuthorizationError, match="explicit non-mutating allow"):
         gate.authorize_card(conn, {"id": "legacy"})
+
+
+def test_doc_budget_manifest_constructs_exact_atomic_graph_and_blocked_preflight(board):
+    from hermes_cli import kanban_pipeline_mutation as pipeline
+    import hashlib
+    conn,root=board
+    script=_script(root,"budget-allow.py",'''import json,sys
+if sys.argv[1]=="validate-pipeline":
+ manifest=json.load(open(sys.argv[2])); cards=manifest["cards"]
+ allow=(len(cards)==2 and cards[0]["doc_budget_bytes"]==20000 and
+        cards[1]["stage"]=="operator_preflight" and cards[1]["initial_status"]=="blocked")
+ print(json.dumps({"schema_version":"fellowship-pipeline-preflight.v1","ok":allow,"mutate_board":False}))
+ sys.exit(0 if allow else 2)
+card=json.load(open(sys.argv[2])); allow=card["status"] in ("ready","blocked")
+print(json.dumps({"schema_version":"fellowship-authoritative-policy.v2","authoritative":True,"dispatch_allowed":allow,"mutate_board":False}))
+sys.exit(0 if allow else 2)
+''')
+    _enable(root,script)
+    cards=[{"key":"requirements","stage":"requirements","title":"requirements","body":"bounded","assignee":"worker","parents":[],"doc_budget_bytes":20000},
+           {"key":"preflight","stage":"operator_preflight","title":"preflight","body":"stop","assignee":"operator","parents":["requirements"],"initial_status":"blocked"}]
+    manifest={"schema_version":"fellowship-pipeline.v1","feature_id":"F-budget","cards":cards}
+    frozen=json.loads(json.dumps(manifest)); expected_sha=hashlib.sha256(json.dumps(manifest,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
+    mapping=pipeline.create_pipeline(conn,manifest,cards)
+    assert manifest==frozen and cards==frozen["cards"]
+    assert set(mapping)=={"requirements","preflight"}
+    assert kb.get_task(conn,mapping["preflight"]).status=="blocked"
+    assert tuple(conn.execute("SELECT parent_id,child_id FROM task_links").fetchone())==(mapping["requirements"],mapping["preflight"])
+    row=conn.execute("SELECT manifest_sha256,mapping_json FROM jev_pipeline_publications WHERE feature_id=?",("F-budget",)).fetchone()
+    assert row["manifest_sha256"]==expected_sha and json.loads(row["mapping_json"])==mapping
+    assert pipeline.create_pipeline(conn,manifest,cards)==mapping
+    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]==2
+
+
+def test_pipeline_rejects_unexpected_card_fields_before_jev_or_write(board,monkeypatch):
+    from hermes_cli import kanban_pipeline_mutation as pipeline
+    conn,_=board
+    seen=[]
+    monkeypatch.setattr(pipeline,"authorize_pipeline",lambda *args: seen.append("gate"))
+    cards=[{"key":"one","stage":"requirements","title":"one","parents":[],"unexpected_policy_bypass":True}]
+    manifest={"schema_version":"fellowship-pipeline.v1","feature_id":"F-unknown","cards":cards}
+    with pytest.raises(pipeline.PipelineConstructionError,match="unexpected"):
+        pipeline.create_pipeline(conn,manifest,cards)
+    assert not seen
+    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]==0
+    assert conn.execute("SELECT COUNT(*) FROM jev_pipeline_publications").fetchone()[0]==0
+
+
+def test_pipeline_rejects_changed_doc_budget_before_jev_or_write(board,monkeypatch):
+    from hermes_cli import kanban_pipeline_mutation as pipeline
+    conn,_=board;seen=[]
+    monkeypatch.setattr(pipeline,"authorize_pipeline",lambda *args: seen.append("gate"))
+    cards=[{"key":"one","stage":"requirements","title":"one","parents":[],"doc_budget_bytes":20000}]
+    manifest={"schema_version":"fellowship-pipeline.v1","feature_id":"F-budget-mismatch","cards":json.loads(json.dumps(cards))}
+    cards[0]["doc_budget_bytes"]=19999
+    with pytest.raises(pipeline.PipelineConstructionError,match="exactly match"):
+        pipeline.create_pipeline(conn,manifest,cards)
+    assert not seen
+    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]==0
+
+
+def test_pipeline_failed_second_write_rolls_back_cards_edges_and_publication(board,monkeypatch):
+    from hermes_cli import kanban_pipeline_mutation as pipeline
+    conn,_=board
+    monkeypatch.setattr(pipeline,"authorize_pipeline",lambda *args:{"ok":True})
+    monkeypatch.setattr(gate,"authorize_card",lambda *args:{"dispatch_allowed":True})
+    original=kb.create_task
+    written=[]
+    def fail_second(*args,**kwargs):
+        if not kwargs.get("_preview_only"):
+            written.append(kwargs["title"])
+            if len(written)==2: raise RuntimeError("interrupted write")
+        return original(*args,**kwargs)
+    monkeypatch.setattr(kb,"create_task",fail_second)
+    cards=[{"key":"one","stage":"requirements","title":"one","parents":[]},
+           {"key":"two","stage":"architecture","title":"two","parents":["one"]}]
+    manifest={"schema_version":"fellowship-pipeline.v1","feature_id":"F-rollback","cards":cards}
+    with pytest.raises(RuntimeError,match="interrupted write"):
+        pipeline.create_pipeline(conn,manifest,cards)
+    assert written==["one","two"]
+    for table in ("tasks","task_links","jev_pipeline_publications"):
+        assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]==0
