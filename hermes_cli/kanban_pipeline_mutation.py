@@ -7,6 +7,19 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_jev_gate import authorize_pipeline
 
 class PipelineConstructionError(ValueError): pass
+
+# Only these manifest fields may become task-creation arguments. JEV-only
+# document budgets remain in the exact validated manifest, never the task API.
+_TASK_FIELDS = frozenset({
+    "title", "body", "assignee", "created_by", "workspace_kind", "workspace_path",
+    "branch_name", "tenant", "priority", "triage", "max_runtime_seconds",
+    "skills", "max_retries", "model_override", "provider_override",
+    "reasoning_effort", "goal_mode", "goal_max_turns", "initial_status",
+    "session_id", "board", "project_id", "project_source_task_id",
+    "creator_task_id", "completion_contract", "worker_max_turns",
+    "budget_exception_reason", "budget_exception_receipt",
+})
+_MANIFEST_FIELDS = _TASK_FIELDS | {"key", "parents", "stage", "doc_budget_bytes", "functional_piece", "required_tests", "idempotency_key"}
 _PIPELINE_CAPABILITY=object()
 def require_pipeline_capability(value):
     if value is not _PIPELINE_CAPABILITY: raise PipelineConstructionError("invalid pipeline authorization capability")
@@ -29,6 +42,8 @@ def create_pipeline(conn, manifest: dict, cards: list[dict[str, Any]]) -> dict[s
     specs={}
     for card in cards:
         if not isinstance(card,dict) or not isinstance(card.get("key"),str) or not card["key"] or card["key"] in specs: raise PipelineConstructionError("every card requires a unique key")
+        unexpected=set(card)-_MANIFEST_FIELDS
+        if unexpected: raise PipelineConstructionError(f"unexpected pipeline card fields: {sorted(unexpected)}")
         parents=card.get("parents",[])
         if not isinstance(parents,list) or any(not isinstance(x,str) for x in parents): raise PipelineConstructionError("card parents must be key arrays")
         if card.get("idempotency_key") is not None: raise PipelineConstructionError("pipeline cards cannot use idempotency_key")
@@ -47,7 +62,7 @@ def create_pipeline(conn, manifest: dict, cards: list[dict[str, Any]]) -> dict[s
         if not ready: raise PipelineConstructionError("pipeline dependency cycle")
         for key in ready:
             card=pending.pop(key);parent_keys=card.get("parents",[]);parent_ids=[task_ids[parent] for parent in parent_keys]
-            kwargs={name:value for name,value in card.items() if name not in {"key","parents","stage"}}
+            kwargs={name:value for name,value in card.items() if name in _TASK_FIELDS}
             explicit=kwargs.get("tenant")
             inherited={tenants[parent] for parent in parent_keys}
             if explicit is None and len(inherited)>1: raise PipelineConstructionError("pipeline parents have incompatible tenants")

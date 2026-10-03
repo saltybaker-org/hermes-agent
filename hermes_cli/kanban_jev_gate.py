@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -117,7 +118,11 @@ def authorize_closure(conn:sqlite3.Connection,evidence:dict,document_bytes:bytes
     cfg=_config(conn)
     if cfg is None: return None
     if not isinstance(document_bytes,(bytes,bytearray)): raise JevAuthorizationError("closure document bytes are required")
-    report=_execute(cfg,["validate-closure","@evidence.json","--document","@document.bin"],{"evidence.json":evidence,"document.bin":bytes(document_bytes)})
+    name = evidence.get("closure_document")
+    if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name)
+          or name == "evidence.json"):
+        raise JevAuthorizationError("unsafe closure document name")
+    report=_execute(cfg,["validate-closure","@evidence.json","--document",f"@{name}"],{"evidence.json":evidence,name:bytes(document_bytes)})
     if report.get("schema_version")!="fellowship-closure-preflight.v1" or report.get("ok") is not True or report.get("mutate_board") is not False:
         raise JevAuthorizationError("JEV closure authorization was not an explicit non-mutating allow")
     return report
