@@ -169,7 +169,7 @@ def test_closure_publication_succeeds_and_retains_exact_bytes(board):
     script=_script(root,"allow-closure.py",'import json;print(json.dumps({"schema_version":"fellowship-closure-preflight.v1","ok":True,"mutate_board":False}))')
     _enable(root,script)
     document=root/"closure.md";document.write_bytes(b"exact closure bytes")
-    evidence={"feature_id":"F-1","tests":["pass"]}
+    evidence={"feature_id":"F-1","closure_document":"closure.md","tests":["pass"]}
     assert publish_closure(conn,task_id,evidence=evidence,document=document,result="published")
     assert kb.get_task(conn,task_id).status=="done"
     row=conn.execute("SELECT evidence_json,document_bytes FROM task_closure_publications WHERE task_id=?",(task_id,)).fetchone()
@@ -244,7 +244,7 @@ def test_closure_artifact_hashes_revalidated_inside_transaction(board,monkeypatc
         return original(*args,**kwargs)
     monkeypatch.setattr(kb,"complete_task",tamper)
     with pytest.raises(gate.JevAuthorizationError,match="artifact"):
-        closure.publish_closure(conn,task,evidence={"feature_id":"F-hash"},document=doc)
+        closure.publish_closure(conn,task,evidence={"feature_id":"F-hash","closure_document":"closure.md"},document=doc)
     assert kb.get_task(conn,task).status=="ready"
 
 
@@ -287,7 +287,7 @@ def test_publish_closure_cli_completes_the_exact_live_worker_run(board,monkeypat
     kbd._set_worker_pid(conn,task_id,os.getpid())
     script=_script(root,"allow-cli-closure.py",'import json;print(json.dumps({"schema_version":"fellowship-closure-preflight.v1","ok":True,"mutate_board":False}))')
     _enable(root,script)
-    evidence=root/"evidence.json";evidence.write_text(json.dumps({"feature_id":"F-cli"}))
+    evidence=root/"evidence.json";evidence.write_text(json.dumps({"feature_id":"F-cli","closure_document":"closure.md"}))
     document=root/"closure.md";document.write_bytes(b"exact cli closure")
     monkeypatch.setenv("HERMES_KANBAN_TASK",task_id)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID",str(claimed.current_run_id))
@@ -297,7 +297,7 @@ def test_publish_closure_cli_completes_the_exact_live_worker_run(board,monkeypat
     assert kc._cmd_publish_closure(args)==0
     assert kb.get_task(conn,task_id).status=="done"
     row=conn.execute("SELECT evidence_json,document_bytes FROM task_closure_publications WHERE task_id=?",(task_id,)).fetchone()
-    assert json.loads(row["evidence_json"])=={"feature_id":"F-cli"}
+    assert json.loads(row["evidence_json"])=={"feature_id":"F-cli","closure_document":"closure.md"}
     assert bytes(row["document_bytes"])==b"exact cli closure"
 
 
@@ -425,3 +425,73 @@ def test_pipeline_failed_second_write_rolls_back_cards_edges_and_publication(boa
     assert written==["one","two"]
     for table in ("tasks","task_links","jev_pipeline_publications"):
         assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]==0
+
+
+def _valid_jev_closure_evidence(name="closure.md"):
+    candidate = "a" * 40
+    merge = "b" * 40
+    return {
+        "schema_version": "fellowship-closure.v1", "feature_id": "F-123",
+        "closure_document": name, "max_words": 100, "candidate_sha": candidate,
+        "files": ["src/example.py"],
+        "required_checks": [{"name": "test", "conclusion": "SUCCESS", "sha": candidate}],
+        "reviews": [
+            {"kind": kind, "verdict": verdict, "sha": candidate, "reviewer": kind, "author": "builder"}
+            for kind, verdict in (("security", "APPROVE"), ("qa", "PASS"))
+        ],
+        "merge": {"head_sha": candidate, "merge_sha": merge, "verified_content_equal": True},
+        "deployment": {"id": "deployment-1", "commit_sha": merge},
+        "acceptance": [
+            {"kind": kind, "verdict": "PASS", "deployment_id": "deployment-1", "commit_sha": merge}
+            for kind in ("acceptance", "reliability")
+        ],
+        "findings": [],
+    }
+
+
+def test_real_jev_closure_publication_preserves_document_basename(board, monkeypatch):
+    """Exercise the installed validator, not a canned allow report, on a disposable board."""
+    from hermes_cli.kanban_closure_mutation import publish_closure
+    conn, root = board
+    evaluator = Path("/usr/local/bin/fellowship-jev")
+    sandbox = Path("/usr/bin/bwrap")
+    if not evaluator.is_file() or not sandbox.is_file():
+        pytest.skip("trusted JEV evaluator and sandbox not installed")
+    task = kb.create_task(conn, title="closure")
+    with kb.write_txn(conn):
+        kb._append_event(conn, task, "pipeline_stage", {"stage": "closure_merge", "feature_id": "F-123"})
+    (root / "board.json").write_text(json.dumps({"jev_mutation_gate": {"enabled": True}}))
+    monkeypatch.setattr(gate, "_trusted_command", lambda: [str(evaluator)])
+    document = root / "closure.md"
+    content = b"Slice: F-123\nPRD: product requirements\nClosure approved.\n"
+    document.write_bytes(content)
+    evidence = _valid_jev_closure_evidence()
+    assert publish_closure(conn, task, evidence=evidence, document=document, result="published")
+    row = conn.execute("SELECT evidence_json, document_bytes FROM task_closure_publications WHERE task_id=?", (task,)).fetchone()
+    assert json.loads(row["evidence_json"]) == evidence
+    assert bytes(row["document_bytes"]) == content
+    assert kb.get_task(conn, task).status == "done"
+
+
+@pytest.mark.parametrize("name", ["../escape.md", "/tmp/escape.md", "dir/closure.md", "dir\\closure.md", "..", ".", "evidence.json", "", None, 42, "bad\x00name.md", " a.md", "a.md "])
+def test_closure_rejects_unsafe_evidence_document_name_before_staging(board, monkeypatch, name):
+    conn, root = board
+    (root / "board.json").write_text(json.dumps({"jev_mutation_gate": {"enabled": True}}))
+    monkeypatch.setattr(gate, "_execute", lambda *_: pytest.fail("unsafe name reached filesystem staging"))
+    with pytest.raises(gate.JevAuthorizationError, match="closure document name"):
+        gate.authorize_closure(conn, {"closure_document": name}, b"content")
+
+
+def test_closure_rejects_evidence_name_different_from_supplied_document(board, monkeypatch):
+    from hermes_cli.kanban_closure_mutation import publish_closure
+    conn, root = board
+    task = kb.create_task(conn, title="closure")
+    with kb.write_txn(conn):
+        kb._append_event(conn, task, "pipeline_stage", {"stage": "closure_merge", "feature_id": "F-123"})
+    document = root / "different.md"
+    document.write_bytes(b"content")
+    (root / "board.json").write_text(json.dumps({"jev_mutation_gate": {"enabled": True}}))
+    monkeypatch.setattr(gate, "_execute", lambda *_: pytest.fail("mismatched name reached evaluator"))
+    with pytest.raises(gate.JevAuthorizationError, match="closure document name"):
+        publish_closure(conn, task, evidence={"feature_id": "F-123", "closure_document": "closure.md"}, document=document)
+    assert kb.get_task(conn, task).status != "done"

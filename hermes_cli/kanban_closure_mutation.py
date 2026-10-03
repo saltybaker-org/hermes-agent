@@ -29,6 +29,8 @@ def require_completion_capability(conn,task_id,capability,report):
  return True
 def publish_closure(conn,task_id,*,evidence:dict,document:Path,result=None,summary=None,metadata=None,created_cards=None,expected_run_id=None,force=False):
  if not isinstance(evidence,dict): raise JevAuthorizationError("closure evidence must be an object")
+ if "closure_document" in evidence and evidence["closure_document"] != Path(document).name:
+  raise JevAuthorizationError("closure document name does not match evidence")
  try: document_bytes=Path(document).read_bytes()
  except OSError as exc: raise JevAuthorizationError("closure document is unreadable") from exc
  binding=_binding(conn,task_id,evidence,document_bytes)
