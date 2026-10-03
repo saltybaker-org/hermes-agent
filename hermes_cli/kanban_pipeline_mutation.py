@@ -19,7 +19,7 @@ _TASK_FIELDS = frozenset({
     "creator_task_id", "completion_contract", "worker_max_turns",
     "budget_exception_reason", "budget_exception_receipt",
 })
-_MANIFEST_FIELDS = _TASK_FIELDS | {"key", "parents", "stage", "doc_budget_bytes", "idempotency_key"}
+_MANIFEST_FIELDS = _TASK_FIELDS | {"key", "parents", "stage", "doc_budget_bytes", "functional_piece", "required_tests", "idempotency_key"}
 _PIPELINE_CAPABILITY=object()
 def require_pipeline_capability(value):
     if value is not _PIPELINE_CAPABILITY: raise PipelineConstructionError("invalid pipeline authorization capability")

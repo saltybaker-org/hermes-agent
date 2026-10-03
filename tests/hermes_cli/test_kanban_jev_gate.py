@@ -357,6 +357,26 @@ sys.exit(0 if allow else 2)
     assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]==2
 
 
+
+def test_pipeline_preserves_jev_only_implementation_metadata_without_task_kwargs(board, monkeypatch):
+    from hermes_cli import kanban_pipeline_mutation as pipeline
+    conn, _ = board
+    seen = []
+    monkeypatch.setattr(pipeline, "authorize_pipeline", lambda _conn, manifest: seen.append(manifest) or {"ok": True})
+    monkeypatch.setattr(gate, "authorize_card", lambda *_: {"dispatch_allowed": True})
+    cards = [
+        {"key": "requirements", "stage": "requirements", "title": "requirements", "body": "bounded", "parents": [], "doc_budget_bytes": 20000},
+        {"key": "implementation", "stage": "implementation", "title": "implementation", "body": "test-first", "parents": ["requirements"],
+         "functional_piece": "catalog persistence and administrator API", "required_tests": ["unique SKU and stock invariant"]},
+    ]
+    manifest = {"schema_version": "fellowship-pipeline.v1", "feature_id": "F-metadata", "cards": cards}
+    mapping = pipeline.create_pipeline(conn, manifest, cards)
+    assert seen == [manifest]
+    assert set(mapping) == {"requirements", "implementation"}
+    assert conn.execute("SELECT COUNT(*) FROM jev_pipeline_publications WHERE feature_id='F-metadata'").fetchone()[0] == 1
+    assert kb.get_task(conn, mapping["implementation"]).title == "implementation"
+
+
 def test_pipeline_rejects_unexpected_card_fields_before_jev_or_write(board,monkeypatch):
     from hermes_cli import kanban_pipeline_mutation as pipeline
     conn,_=board
